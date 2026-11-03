@@ -371,7 +371,8 @@ def test_usage_errors_exit_2():
     assert cli("inspect", "https://evil.com/a/b").exit_code == 2
     assert cli("inspect", str(FIXTURES / "vite-app"), "--ref", "main").exit_code == 2
     assert cli("inspect", str(FIXTURES / "vite-app"), "--subdir", "../x").exit_code == 2
-    assert cli("inspect", str(FIXTURES / "vite-app"), "--entry", "bad").exit_code in (0, 2)
+    assert cli("inspect", str(FIXTURES / "fastapi-app"), "--entry", "bad").exit_code == 2
+    assert cli("inspect", str(FIXTURES / "vite-app"), "--runtime-version", "3.12").exit_code == 2
 
 
 def test_internal_error_exit_1(monkeypatch):

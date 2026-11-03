@@ -114,10 +114,12 @@ def make_bundle(src: Path, out: Path, **opts) -> Path:
         return write_bundle(insp, snap, out, acq.root).path
 
 
-def resolved_config(project: str, port: int, host_port: int | None = None, **svc_overrides) -> dict:
+def resolved_config(
+    project: str, port: int, host_port: int | None = None, context: str = "/bundle", **svc_overrides
+) -> dict:
     """What `docker compose config --format json` prints for a healthy r2t bundle."""
     svc = {
-        "build": {"context": "/ignored-by-tests", "dockerfile": "Dockerfile"},
+        "build": {"context": context, "dockerfile": "Dockerfile"},
         "image": f"r2t/{project}:latest",
         "ports": [
             {
@@ -169,7 +171,13 @@ class DockerFake:
                 if hasattr(self, "last_env")
                 else self.port
             )
-            cfg = resolved_config(self.project, self.port, host_port, **self.config_overrides)
+            cfg = resolved_config(
+                self.project,
+                self.port,
+                host_port,
+                context=str(self.bundle),
+                **self.config_overrides,
+            )
             return RunResult(argv, 0, __import__("json").dumps(cfg))
         if verb == "build":
             if self.build_exc:

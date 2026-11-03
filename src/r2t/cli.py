@@ -97,7 +97,10 @@ def guarded(fn):
         except typer.Exit:
             raise
         except R2TError as exc:
-            err.print(f"[red]error:[/red] {esc(exc.message)}")
+            first, *rest = exc.message.splitlines() or [""]
+            err.print(f"[red]error:[/red] {esc(first)}")
+            for line in rest:
+                err.print(esc(line))
             if exc.hint:
                 err.print(f"[dim]hint:[/dim] {esc(exc.hint)}")
             raise typer.Exit(exc.exit_code) from None
