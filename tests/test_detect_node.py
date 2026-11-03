@@ -227,7 +227,8 @@ def test_lifecycle_scripts_listed_with_evidence(make_tree):
 @pytest.mark.parametrize(
     "files,image",
     [
-        ({".nvmrc": "v24.1.0\n"}, "node:24-bookworm-slim"),
+        ({".nvmrc": "v24.1.0\n"}, "node:24.1.0-bookworm-slim"),
+        ({".nvmrc": "24\n"}, "node:24-bookworm-slim"),
         ({".node-version": "22\n"}, "node:22-bookworm-slim"),
         ({"engines": ">=22 <24"}, "node:22-bookworm-slim"),
         ({"engines": ">=20.9.0"}, "node:26-bookworm-slim"),
@@ -319,3 +320,75 @@ def test_fixture_copy_is_unchanged_by_analysis(tmp_path):
     before = sorted(p.relative_to(copy).as_posix() for p in copy.rglob("*"))
     run_analyze(copy)
     assert sorted(p.relative_to(copy).as_posix() for p in copy.rglob("*")) == before
+
+
+# ---- full-version constraint intersection (not just majors) -------------------------------
+
+
+def _node_case(make_tree, nvmrc=None, engines=None, **opts):
+    files = {"package.json": pkg(**({"engines": {"node": engines}} if engines else {}))}
+    if nvmrc:
+        files[".nvmrc"] = nvmrc
+    insp, _, _ = run_analyze(make_tree(files), **opts)
+    return insp
+
+
+def test_nvmrc_patch_below_engines_minimum_is_a_conflict(make_tree):
+    """Regression: .nvmrc=22.1.0 with engines >=22.5.0 used to be reported as supported."""
+    insp = _node_case(make_tree, nvmrc="22.1.0", engines=">=22.5.0")
+    assert insp.status == "needs_input"
+    assert blockers(insp) == [("needs_input", "--runtime-version MAJOR")]
+    assert "conflict" in insp.blockers[0].reason
+    assert insp.base_image is None
+
+
+def test_conflict_is_resolved_by_the_override(make_tree):
+    insp = _node_case(make_tree, nvmrc="22.1.0", engines=">=22.5.0", runtime_version="22")
+    assert insp.status == "supported" and insp.base_image == "node:22-bookworm-slim"
+
+
+@pytest.mark.parametrize(
+    "nvmrc,engines,image",
+    [
+        # open-ended within the major: the floating major tag satisfies it
+        ("22", ">=22.5.0", "node:22-bookworm-slim"),
+        (None, ">=22.5.0 <23", "node:22-bookworm-slim"),
+        (None, "^22.5.0", "node:22-bookworm-slim"),
+        # an exact pin is honoured with the exact image tag
+        ("22.1.0", None, "node:22.1.0-bookworm-slim"),
+        ("v22.11.0", None, "node:22.11.0-bookworm-slim"),
+        ("22.5.0", ">=22.5.0", "node:22.5.0-bookworm-slim"),
+        ("22.6.0", ">=22.5.0 <23", "node:22.6.0-bookworm-slim"),
+        # a pin in a newer major wins over a permissive range
+        ("24.1.0", ">=20", "node:24.1.0-bookworm-slim"),
+    ],
+)
+def test_image_satisfies_the_full_constraints(make_tree, nvmrc, engines, image):
+    insp = _node_case(make_tree, nvmrc=nvmrc, engines=engines)
+    assert insp.status == "supported", insp.blockers
+    assert insp.base_image == image
+
+
+def test_exact_pin_is_recorded_as_an_assumption_about_the_tag(make_tree):
+    insp = _node_case(make_tree, nvmrc="22.1.0")
+    assert any("22.1.0" in a and "exact" in a for a in insp.assumptions)
+
+
+@pytest.mark.parametrize("engines", ["~22.1.0", "22.1.x", ">=22 <22.5.0", "<22.5.0 >=22"])
+def test_bounded_range_inside_a_major_needs_input_because_a_floating_tag_may_not_fit(
+    make_tree, engines
+):
+    insp = _node_case(make_tree, engines=engines)
+    assert blockers(insp) == [("needs_input", "--runtime-version MAJOR")]
+    assert "floating" in insp.blockers[0].reason
+    assert _node_case(make_tree, engines=engines, runtime_version="22").status == "supported"
+
+
+def test_lower_major_is_used_when_the_highest_cannot_be_satisfied(make_tree):
+    insp = _node_case(make_tree, engines="^22.0.0 || ~26.1.0")
+    assert insp.status == "supported" and insp.base_image == "node:22-bookworm-slim"
+
+
+def test_union_with_open_top_piece_picks_highest_major(make_tree):
+    insp = _node_case(make_tree, engines="^22.0.0 || >=24.2.0")
+    assert insp.base_image == "node:26-bookworm-slim"

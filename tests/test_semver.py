@@ -1,7 +1,11 @@
 import pytest
 
-from r2t.detect.node import node_versions_for
-from r2t.detect.semver import RangeError
+from r2t.detect.semver import RangeError, parse_range, satisfies_major
+
+
+def node_versions_for(text):
+    intervals = parse_range(text)
+    return {m for m in range(10, 40) if satisfies_major(intervals, m)}
 
 
 @pytest.mark.parametrize(
@@ -36,3 +40,13 @@ def test_ranges(text, expected_members, expected_non_members):
 def test_unparseable(text):
     with pytest.raises(RangeError):
         node_versions_for(text)
+
+
+def test_intersect_uses_full_versions():
+    from r2t.detect.semver import intersect
+
+    assert intersect(parse_range("22.1.0"), parse_range(">=22.5.0")) == []
+    assert intersect(parse_range("22"), parse_range(">=22.5.0")) == [((22, 5, 0), (23, 0, 0))]
+    assert intersect(parse_range("^22 || ^24"), parse_range(">=24.2.0")) == [
+        ((24, 2, 0), (25, 0, 0))
+    ]

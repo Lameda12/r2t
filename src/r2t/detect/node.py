@@ -22,7 +22,7 @@ from ..models import (
 from ..snapshot import Snapshot
 from ..text import clean
 from .common import NODE_SERVICE_DEPS
-from .semver import RangeError, parse_range, satisfies_major
+from .semver import RangeError, Version, intersect, parse_range
 
 # Checked on 2026-11-03 against https://nodejs.org/dist/index.json and
 # https://github.com/nodejs/Release/blob/main/schedule.json: 22 (maintenance until 2027-04-30),
@@ -110,12 +110,6 @@ def parse_dev_script(script: str) -> tuple[str, int | None]:
     return binary, port
 
 
-def node_versions_for(text: str) -> set[int]:
-    """Node majors (10-39) that a version range or .nvmrc-style string allows."""
-    intervals = parse_range(text)
-    return {m for m in range(10, 40) if satisfies_major(intervals, m)}
-
-
 def _first_line(text: str) -> str:
     for line in text.splitlines():
         line = line.strip()
@@ -166,13 +160,13 @@ def _node_version(insp: Inspection, snap: Snapshot, pkg: dict, opts: Options) ->
         insp.add("runtime", f"Node {NODE_DEFAULT}", Evidence("default", detail="default LTS major"))
         return
 
-    allowed: set[int] | None = None
+    allowed: list[tuple[Version, Version]] | None = None
     evidences = []
     for label, text, ev in sources:
         insp.runtime_constraints.append(f"{label}: {clean(text)}")
         evidences.append(ev)
         try:
-            majors = node_versions_for(text)
+            intervals = parse_range(text)
         except RangeError as exc:
             insp.block(
                 NEEDS_INPUT,
@@ -181,7 +175,8 @@ def _node_version(insp: Inspection, snap: Snapshot, pkg: dict, opts: Options) ->
                 ev,
             )
             return
-        allowed = majors if allowed is None else allowed & majors
+        # intersect the complete constraints, not just their majors
+        allowed = intervals if allowed is None else intersect(allowed, intervals)
     assert allowed is not None  # noqa: S101
     found = "; ".join(insp.runtime_constraints)
     if not allowed:
@@ -189,24 +184,74 @@ def _node_version(insp: Inspection, snap: Snapshot, pkg: dict, opts: Options) ->
             NEEDS_INPUT, f"the Node version sources conflict ({found})", RUNTIME_FLAG, *evidences
         )
         return
-    choices = sorted(allowed & set(NODE_MAINTAINED))
-    if not choices:
-        insp.block(
-            NEEDS_INPUT,
-            f"no maintained Node major {list(NODE_MAINTAINED)} satisfies {found}",
-            RUNTIME_FLAG,
-            *evidences,
-        )
+    usable, bounded = _usable_images(allowed)
+    if not usable:
+        if bounded:
+            insp.block(
+                NEEDS_INPUT,
+                f"{found} allows only part of a major (for example {bounded[0]}), and the "
+                f"floating node:MAJOR image tag may not fall inside it. Pass --runtime-version "
+                "to accept the latest release of that major",
+                RUNTIME_FLAG,
+                *evidences,
+            )
+        else:
+            insp.block(
+                NEEDS_INPUT,
+                f"no maintained Node major {list(NODE_MAINTAINED)} satisfies {found}",
+                RUNTIME_FLAG,
+                *evidences,
+            )
         return
-    major = choices[-1]
-    insp.base_image = f"node:{major}-bookworm-slim"
-    insp.add("runtime", f"Node {major}", *evidences)
-    if len(choices) > 1:
-        others = ", ".join(map(str, choices[:-1]))
+    major, image, exact = usable[-1]
+    insp.base_image = f"node:{image}-bookworm-slim"
+    insp.add("runtime", f"Node {image}", *evidences)
+    if exact:
+        insp.assumptions.append(
+            f"The declared constraints pin exactly Node {image}, so the exact image tag "
+            f"{insp.base_image} is used; it must exist on Docker Hub or the build will fail"
+        )
+    others = [str(m) for m, _, _ in usable[:-1]]
+    if others:
         insp.assumptions.append(
             f"Node {major} is the highest maintained major that satisfies the declared "
-            f"constraints (also allowed: {others})"
+            f"constraints (also allowed: {', '.join(others)})"
         )
+
+
+def _usable_images(
+    allowed: list[tuple[Version, Version]],
+) -> tuple[list[tuple[int, str, bool]], list[str]]:
+    """Maintained majors whose image tag is guaranteed to satisfy `allowed`.
+
+    A floating `node:MAJOR` tag is safe when the constraints are open-ended up to the next
+    major. A constraint that pins one exact version maps to that exact tag. Anything in
+    between cannot be promised by a tag, so it is reported in `bounded`.
+    Returns ([(major, tag version, is_exact)] ascending by major, bounded examples).
+    """
+    usable: list[tuple[int, str, bool]] = []
+    bounded: list[str] = []
+    for major in NODE_MAINTAINED:
+        top: Version = (major + 1, 0, 0)
+        pieces = sorted(
+            (max(lo, (major, 0, 0)), min(hi, top))
+            for lo, hi in allowed
+            if max(lo, (major, 0, 0)) < min(hi, top)
+        )
+        choice = None
+        for lo, hi in reversed(pieces):
+            if hi == top:
+                choice = (major, str(major), False)
+                break
+            if hi == (lo[0], lo[1], lo[2] + 1):
+                choice = (major, f"{lo[0]}.{lo[1]}.{lo[2]}", True)
+                break
+        if choice:
+            usable.append(choice)
+        elif pieces:
+            lo, hi = pieces[-1]
+            bounded.append(f">={lo[0]}.{lo[1]}.{lo[2]} <{hi[0]}.{hi[1]}.{hi[2]}")
+    return usable, bounded
 
 
 def _package_manager(insp: Inspection, snap: Snapshot, pkg: dict, opts: Options) -> bool:

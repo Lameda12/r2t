@@ -113,7 +113,20 @@ def parse_range(text: str) -> list[tuple[Version, Version]]:
         raise RangeError("empty range")
     if len(text) > 200:
         raise RangeError("range too long")
-    return [_set(part) for part in text.split("||")]
+    return [(lo, hi) for lo, hi in (_set(part) for part in text.split("||")) if lo < hi]
+
+
+def intersect(
+    a: list[tuple[Version, Version]], b: list[tuple[Version, Version]]
+) -> list[tuple[Version, Version]]:
+    """Intersection of two unions of half-open intervals (empty list means unsatisfiable)."""
+    out = []
+    for lo1, hi1 in a:
+        for lo2, hi2 in b:
+            lo, hi = max(lo1, lo2), min(hi1, hi2)
+            if lo < hi:
+                out.append((lo, hi))
+    return sorted(out)
 
 
 def satisfies_major(intervals: list[tuple[Version, Version]], major: int) -> bool:
