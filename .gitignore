@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+# fixture installs
+tests/fixtures/**/node_modules/
+# real env files never belong in the repo
+.env
