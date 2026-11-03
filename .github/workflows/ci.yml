@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # main plus the branches development actually happens on (this repository's only
+    # branch is claude/...; feat/... is the spec's suggested name)
+    branches: [main, "claude/**", "feat/**"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
