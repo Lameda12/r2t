@@ -47,7 +47,7 @@ class Runner(Protocol):
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
         timeout: float,
-        stream: bool = False,
+        stream: bool | str = False,
     ) -> RunResult: ...
 
 
@@ -77,10 +77,12 @@ class SubprocessRunner:
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
         timeout: float,
-        stream: bool = False,
+        stream: bool | str = False,
     ) -> RunResult:
         argv = [str(a) for a in args]
         run_env = dict(env) if env is not None else base_env()
+        if stream == "inherit":
+            return self._inherit(argv, cwd, run_env, timeout)
         if stream:
             return self._stream(argv, cwd, run_env, timeout)
         try:
@@ -101,6 +103,18 @@ class SubprocessRunner:
             out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else ""
             return RunResult(argv, 124, stdout=out, stderr="timed out", timed_out=True)
         return RunResult(argv, proc.returncode, proc.stdout, proc.stderr)
+
+    def _inherit(self, argv: list[str], cwd: Path | None, env: dict[str, str], timeout: float):
+        """Let the child write straight to our stdout/stderr (used for `logs --follow`)."""
+        try:
+            proc = subprocess.run(  # noqa: S603
+                argv, cwd=cwd, env=env, timeout=timeout, check=False, stdin=subprocess.DEVNULL
+            )
+        except FileNotFoundError:
+            return RunResult(argv, 127, stderr=f"{argv[0]}: command not found")
+        except subprocess.TimeoutExpired:
+            return RunResult(argv, 124, timed_out=True)
+        return RunResult(argv, proc.returncode)
 
     def _stream(self, argv: list[str], cwd: Path | None, env: dict[str, str], timeout: float):
         """Echo combined output to stderr as it arrives; keep a tail for failure reports."""

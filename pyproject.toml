@@ -59,7 +59,7 @@ extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
-ignore = ["S404"]
+ignore = ["S404", "B008"]  # B008: Typer declares options as defaults
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S104", "S105", "S106", "S108", "S603", "S607"]

@@ -408,9 +408,12 @@ def write_bundle(
                 "the output directory must be outside the source being inspected",
                 f"{target} is inside {forbidden}",
             )
-    parent.mkdir(parents=True, exist_ok=True)
     tmp = parent / f".{out.name}.r2t-tmp-{secrets.token_hex(4)}"
-    tmp.mkdir()
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        tmp.mkdir()
+    except OSError as exc:
+        raise InputError(f"cannot create the output directory: {exc.strerror or exc}") from exc
     try:
         supported = insp.status == SUPPORTED
         bundle_id = project = image = dockerfile = compose = None
