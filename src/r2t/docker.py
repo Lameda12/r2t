@@ -176,19 +176,71 @@ def _is_root_user(value: object) -> bool:
     return name == "root" or (name.isdigit() and int(name) == 0)
 
 
-def _dockerfile_final_user(path: Path) -> str | None:
-    """The USER in effect at the end of the last build stage, or None (meaning root)."""
-    user = None
-    try:
-        lines = path.read_text(errors="replace").splitlines()
-    except OSError:
-        return None
-    for line in lines:
-        m = re.match(r"^\s*(FROM|USER)\s+(\S+)", line, re.I)
-        if not m:
+def _instructions(text: str) -> list[tuple[str, str]]:
+    """(INSTRUCTION, arguments) pairs: comments dropped, backslash continuations joined."""
+    out: list[tuple[str, str]] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not pending and (not line or line.startswith("#")):
             continue
-        user = None if m.group(1).upper() == "FROM" else m.group(2)
-    return user
+        if line.startswith("#"):  # comment line inside a continued instruction
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        full = (pending + line).strip()
+        pending = ""
+        name, _, rest = full.partition(" ")
+        out.append((name.upper(), rest.strip()))
+    if pending.strip():
+        name, _, rest = pending.strip().partition(" ")
+        out.append((name.upper(), rest.strip()))
+    return out
+
+
+def dockerfile_user(text: str, target: str | None = None) -> tuple[str | None, str | None]:
+    """The user a Dockerfile's selected build stage ends with.
+
+    Returns (user, error). user None with no error means root (no USER, external base image).
+    A stage built FROM an earlier stage inherits that stage's user. Variables in FROM or
+    USER cannot be resolved here, so they are an error rather than a guess.
+    `target` selects a named stage (case-insensitive) instead of the last one.
+    """
+    stages: list[dict] = []  # {"name", "user", "unresolved"}
+    by_name: dict[str, dict] = {}
+    for name, rest in _instructions(text):
+        if name == "FROM":
+            tokens = [t for t in rest.split() if not t.startswith("--")]
+            if not tokens:
+                return None, "a FROM instruction has no image"
+            base = tokens[0]
+            stage = {"name": None, "user": None, "unresolved": "$" in base}
+            if len(tokens) >= 3 and tokens[1].upper() == "AS":
+                stage["name"] = tokens[2].lower()
+            parent = by_name.get(base.lower())
+            if parent is not None:
+                stage["user"], stage["unresolved"] = parent["user"], parent["unresolved"]
+            stages.append(stage)
+            if stage["name"]:
+                by_name[stage["name"]] = stage
+        elif name == "USER" and stages:
+            value = rest.split()[0] if rest.split() else ""
+            if "$" in value:
+                stages[-1]["unresolved"] = True
+            else:
+                stages[-1]["user"], stages[-1]["unresolved"] = value, False
+    if not stages:
+        return None, "the Dockerfile has no FROM instruction"
+    if target:
+        chosen = by_name.get(target.lower())
+        if chosen is None:
+            return None, f"build target {target!r} is not a stage of the Dockerfile"
+    else:
+        chosen = stages[-1]
+    if chosen["unresolved"]:
+        return None, "the user depends on a variable (ARG) that r2t cannot resolve"
+    return chosen["user"], None
 
 
 def boundary_problems(bundle_dir: Path) -> list[str]:
@@ -275,17 +327,29 @@ def safety_problems(config: dict, bundle_dir: Path) -> list[str]:
                 problems.append(f"{tag} uses build additional_contexts, ssh or secrets")
             if build.get("network") == "host":
                 problems.append(f"{tag} builds with the host network")
-            if ctx_path is not None and not build.get("dockerfile_inline"):
+            if ctx_path is not None:
+                inline = build.get("dockerfile_inline")
                 df = build.get("dockerfile") or "Dockerfile"
                 df_path = Path(df) if os.path.isabs(df) else ctx_path / df
-                if not _inside(df_path, bundle_dir):
+                text = None
+                if inline:
+                    text = inline
+                elif not _inside(df_path, bundle_dir):
                     problems.append(f"{tag} uses a Dockerfile outside the bundle ({df})")
-                elif user is None and df_path.is_file():
-                    final = _dockerfile_final_user(df_path)
-                    if final is None or _is_root_user(final):
+                elif df_path.is_file():
+                    text = df_path.read_text(errors="replace")
+                if text is not None and user is None:
+                    final, error = dockerfile_user(text, build.get("target"))
+                    stage = f" (target {build['target']!r})" if build.get("target") else ""
+                    if error:
                         problems.append(
-                            f"{tag} would run as root: the Dockerfile does not end with a "
-                            "non-root USER and compose.yaml sets no user"
+                            f"{tag}: cannot verify that the container runs as non-root{stage}: "
+                            f"{error}. Set `user:` in compose.yaml or simplify the Dockerfile"
+                        )
+                    elif final is None or _is_root_user(final):
+                        problems.append(
+                            f"{tag} would run as root{stage}: the selected Dockerfile stage "
+                            "does not end with a non-root USER and compose.yaml sets no user"
                         )
         elif build is not None:
             problems.append(f"{tag} has an unrecognized build section")

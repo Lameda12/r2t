@@ -34,9 +34,9 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def docker(*args: str, check: bool = True) -> str:
+def docker(*args: str, check: bool = True, stdin: str | None = None) -> str:
     proc = subprocess.run(
-        ["docker", *args], capture_output=True, text=True, check=False, timeout=300
+        ["docker", *args], capture_output=True, text=True, check=False, timeout=300, input=stdin
     )
     if check and proc.returncode:
         raise AssertionError(f"docker {' '.join(args)} failed: {proc.stderr}")
@@ -305,4 +305,146 @@ def test_stray_http_200_without_the_container_is_not_reported_as_ready(tmp_path)
     finally:
         for srv in servers:
             srv.shutdown()
+        _cleanup(runner, bundle)
+
+
+# ---- issue #1: the validator's non-root verdict must match the real effective UID ----------
+
+PY = "FROM python:3.12-slim-bookworm"
+UID_CASES = [
+    # (id, dockerfile, target, can the image really be non-root?)
+    ("last-stage-root", f"{PY} AS a\nUSER 1000\n{PY} AS b\nUSER root\n", None, False),
+    ("last-stage-user", f"{PY} AS a\nUSER root\n{PY} AS b\nUSER 1000\n", None, True),
+    ("earlier-root-target", f"{PY} AS a\nUSER root\n{PY} AS b\nUSER 1000\n", "a", False),
+    ("earlier-user-target", f"{PY} AS a\nUSER 1000\n{PY} AS b\nUSER root\n", "a", True),
+    ("target-case", f"{PY} AS Stage\nUSER root\n{PY} AS b\nUSER 1000\n", "STAGE", False),
+    ("inherit-root", f"{PY} AS base\nUSER root\nFROM base AS app\n", None, False),
+    ("inherit-user", f"{PY} AS base\nUSER 1000\nFROM base AS app\n", None, True),
+    ("inherit-then-root", f"{PY} AS base\nUSER 1000\nFROM base AS app\nUSER 0\n", None, False),
+    ("no-user", f"{PY}\n", None, False),
+    ("user-group", f"{PY}\nUSER 1000:1000\n", None, True),
+    ("root-group", f"{PY}\nUSER root:root\n", None, False),
+    ("continuation", f"{PY}\nRUN true \\\n  && true\nUSER \\\n  1000\n", None, True),
+    ("variable-user", f"{PY}\nARG UID=1000\nUSER ${{UID}}\n", None, True),  # real uid 1000
+    ("variable-root", f"{PY}\nARG UID=0\nUSER ${{UID}}\n", None, False),
+]
+
+
+@pytest.mark.parametrize(
+    "dockerfile,target,really_non_root", [c[1:] for c in UID_CASES], ids=[c[0] for c in UID_CASES]
+)
+@pytest.mark.parametrize("inline", [False, True], ids=["file", "inline"])
+def test_validator_verdict_matches_the_effective_container_uid(
+    dockerfile, target, really_non_root, inline, tmp_path
+):
+    from r2t.docker import safety_problems
+
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    build: dict = {"context": str(ctx)}
+    if inline:
+        build["dockerfile_inline"] = dockerfile
+    else:
+        (ctx / "Dockerfile").write_text(dockerfile)
+        build["dockerfile"] = "Dockerfile"
+    if target:
+        build["target"] = target
+    cfg = {"services": {"app": {"build": build}}}
+    accepted = not [p for p in safety_problems(cfg, ctx) if "root" in p or "verify" in p]
+
+    tag = f"r2t-uid-probe-{abs(hash((dockerfile, target, inline))) % 10**8}"
+    args = ["build", "-q", "-t", tag, "-f", "-", str(ctx)]
+    if target:
+        args[1:1] = ["--target", target]
+    try:
+        docker(*args, stdin=dockerfile)
+        uid = int(docker("run", "--rm", tag, "id", "-u").strip())
+    finally:
+        docker("image", "rm", "-f", tag, check=False)
+
+    assert (uid != 0) is really_non_root, f"test expectation is wrong: real uid {uid}"
+    if accepted:
+        assert uid != 0, "validator accepted a bundle whose container really runs as root"
+    elif really_non_root:
+        # refusing a genuinely non-root image is allowed only when it depends on a variable
+        assert "$" in dockerfile, "validator wrongly refused a resolvable non-root image"
+
+
+def _multistage_bundle(tmp_path: Path, compose_target: str, extra_stage: str) -> tuple[Path, dict]:
+    runner = CliRunner()
+    bundle = tmp_path / "bundle"
+    assert (
+        runner.invoke(app, ["plan", str(FIXTURES / "fastapi-app"), "-o", str(bundle)]).exit_code
+        == 0
+    )
+    docker_file = bundle / "Dockerfile"
+    text = docker_file.read_text().replace(f"{PY}\n", f"{PY} AS app\n", 1)
+    docker_file.write_text(text + "\n" + extra_stage)
+    compose = bundle / "compose.yaml"
+    compose.write_text(
+        compose.read_text().replace(
+            "      dockerfile: Dockerfile",
+            f"      dockerfile: Dockerfile\n      target: {compose_target}",
+        )
+    )
+    return bundle, json.loads((bundle / "plan.json").read_text())
+
+
+def test_run_follows_build_target_to_a_non_root_stage_even_if_the_last_stage_is_root(tmp_path):
+    runner = CliRunner()
+    bundle, plan = _multistage_bundle(tmp_path, "app", f"{PY} AS rootlast\nUSER root\n")
+    try:
+        run = runner.invoke(
+            app, ["run", str(bundle), "--yes", "--timeout", "120", "--host-port", str(free_port())]
+        )
+        assert run.exit_code == 0, run.output + run.stderr
+        cid = docker(
+            "compose", "-p", plan["compose_project"], "-f", str(bundle / "compose.yaml"), "ps", "-q"
+        ).strip()
+        assert docker("exec", cid, "id", "-u").strip() == "1000"
+    finally:
+        _cleanup(runner, bundle)
+
+
+def test_run_refuses_a_root_build_target_before_building(tmp_path):
+    runner = CliRunner()
+    bundle, plan = _multistage_bundle(tmp_path, "rootstage", "")
+    docker_file = bundle / "Dockerfile"
+    docker_file.write_text(
+        f'{PY} AS rootstage\nUSER root\nCMD ["sleep", "60"]\n' + docker_file.read_text()
+    )
+    try:
+        run = runner.invoke(app, ["run", str(bundle), "--yes", "--host-port", str(free_port())])
+        assert run.exit_code == 4, run.output + run.stderr
+        assert "would run as root" in run.stderr and "rootstage" in run.stderr
+        label = f"label=com.docker.compose.project={plan['compose_project']}"
+        assert docker("ps", "-a", "--filter", label, "-q") == ""
+        assert docker("image", "ls", "-q", plan["image"]) == ""
+    finally:
+        _cleanup(runner, bundle)
+
+
+def test_run_refuses_an_inline_root_dockerfile_before_building(tmp_path):
+    runner = CliRunner()
+    bundle = tmp_path / "bundle"
+    assert (
+        runner.invoke(app, ["plan", str(FIXTURES / "fastapi-app"), "-o", str(bundle)]).exit_code
+        == 0
+    )
+    plan = json.loads((bundle / "plan.json").read_text())
+    compose = bundle / "compose.yaml"
+    compose.write_text(
+        compose.read_text().replace(
+            "      dockerfile: Dockerfile",
+            "      dockerfile_inline: |\n"
+            f"        {PY}\n        USER root\n"
+            '        CMD ["sleep", "60"]',
+        )
+    )
+    try:
+        run = runner.invoke(app, ["run", str(bundle), "--yes", "--host-port", str(free_port())])
+        assert run.exit_code == 4, run.output + run.stderr
+        assert "would run as root" in run.stderr
+        assert docker("image", "ls", "-q", plan["image"]) == ""
+    finally:
         _cleanup(runner, bundle)

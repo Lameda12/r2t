@@ -608,3 +608,160 @@ def test_ps_failure_is_not_mistaken_for_a_missing_container(bundle):
     runner, _ = docker_runner(bundle)
     runner.handler = lambda argv: __import__("r2t.runner").runner.RunResult(argv, 1, "", "boom")
     assert container_state(load_bundle(bundle), runner, 8000).state == "unknown"
+
+
+# ---- issue #1: non-root validation must follow build.target and dockerfile_inline --------------
+
+PY = "FROM python:3.12-slim-bookworm"
+
+
+def _build_cfg(bundle, dockerfile=None, **build):
+    """Resolved config whose build uses `dockerfile` text written into the bundle."""
+    if dockerfile is not None:
+        (bundle / "Dockerfile").write_text(dockerfile)
+    cfg = _cfg(bundle)
+    cfg["services"]["app"]["build"].update(build)
+    return cfg
+
+
+def _root_problems(cfg, bundle):
+    return [p for p in safety_problems(cfg, bundle) if "root" in p or "verify" in p]
+
+
+def test_issue_repro_earlier_root_target_is_refused(bundle):
+    dockerfile = f"{PY} AS rootstage\nUSER root\n{PY} AS appstage\nUSER 1000\n"
+    cfg = _build_cfg(bundle, dockerfile, target="rootstage")
+    problems = _root_problems(cfg, bundle)
+    assert problems and "rootstage" in problems[0], problems
+
+
+def test_issue_repro_inline_root_dockerfile_is_refused(bundle):
+    cfg = _cfg(bundle)
+    cfg["services"]["app"]["build"] = {
+        "context": str(bundle),
+        "dockerfile_inline": f"{PY}\nUSER root\n",
+    }
+    assert _root_problems(cfg, bundle)
+
+
+@pytest.mark.parametrize("target", ["appstage", "AppStage"])
+def test_correctly_selected_non_root_stage_is_accepted_even_if_the_last_stage_is_root(
+    bundle, target
+):
+    dockerfile = f"{PY} AS appstage\nUSER 1000\n{PY} AS rootlast\nUSER root\n"
+    cfg = _build_cfg(bundle, dockerfile, target=target)
+    assert _root_problems(cfg, bundle) == []
+
+
+def test_target_names_are_matched_case_insensitively_for_root_stages_too(bundle):
+    dockerfile = f"{PY} AS rootstage\nUSER root\n{PY} AS appstage\nUSER 1000\n"
+    assert _root_problems(_build_cfg(bundle, dockerfile, target="RootStage"), bundle)
+
+
+def test_without_a_target_the_last_stage_decides(bundle):
+    root_last = f"{PY} AS a\nUSER 1000\n{PY} AS b\nUSER root\n"
+    assert _root_problems(_build_cfg(bundle, root_last), bundle)
+    app_last = f"{PY} AS a\nUSER root\n{PY} AS b\nUSER 1000\n"
+    assert _root_problems(_build_cfg(bundle, app_last), bundle) == []
+
+
+def test_unknown_target_is_refused(bundle):
+    cfg = _build_cfg(bundle, f"{PY} AS a\nUSER 1000\n", target="nope")
+    problems = _root_problems(cfg, bundle) + [
+        p for p in safety_problems(cfg, bundle) if "target" in p
+    ]
+    assert any("nope" in p for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    "dockerfile,root",
+    [
+        # a stage built FROM an earlier stage inherits that stage's user
+        (f"{PY} AS base\nUSER root\nFROM base AS app\n", True),
+        (f"{PY} AS base\nUSER 1000\nFROM base AS app\n", False),
+        (f"{PY} AS base\nUSER 1000\nFROM base AS app\nUSER root\n", True),
+        (f"{PY} AS base\nUSER root\nFROM base AS app\nUSER app\n", False),
+        # an external base image with no USER instruction runs as root
+        (f"{PY} AS a\nUSER 1000\nFROM python:3.12 AS b\n", True),
+        # syntax variety
+        (f"{PY}\nuser 1000:1000\n", False),
+        (f"{PY}\nUSER root:root\n", True),
+        ("FROM --platform=linux/amd64 python:3.12 AS x\n# USER root\nUSER 1000\n", False),
+        (f"{PY}\nRUN true \\\n  && true\nUSER \\\n  1000\n", False),
+        (f"{PY}\nUSER 1000\nUSER 0\n", True),
+        ("# syntax=docker/dockerfile:1\n" + f"{PY}\nUSER 1000\n", False),
+    ],
+)
+def test_dockerfile_user_analysis(bundle, dockerfile, root):
+    cfg = _build_cfg(bundle, dockerfile)
+    assert bool(_root_problems(cfg, bundle)) is root
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        f"{PY}\nARG UID=1000\nUSER ${{UID}}\n",
+        f"{PY}\nUSER $UID\n",
+        "ARG BASE=python:3.12\nFROM ${BASE}\n",
+    ],
+)
+def test_users_that_depend_on_variables_cannot_be_verified_and_are_refused(bundle, dockerfile):
+    problems = _root_problems(_build_cfg(bundle, dockerfile), bundle)
+    assert problems and any("verify" in p for p in problems), problems
+    # an explicit non-root compose user makes the Dockerfile irrelevant
+    cfg = _build_cfg(bundle, dockerfile)
+    cfg["services"]["app"]["user"] = "1000"
+    assert _root_problems(cfg, bundle) == []
+
+
+def test_inline_dockerfile_variants(bundle):
+    def inline(text, **extra):
+        cfg = _cfg(bundle)
+        cfg["services"]["app"]["build"] = {
+            "context": str(bundle),
+            "dockerfile_inline": text,
+            **extra,
+        }
+        return cfg
+
+    assert _root_problems(inline(f"{PY}\nUSER 1000\n"), bundle) == []
+    assert _root_problems(inline(f"{PY}\n"), bundle), "no USER at all means root"
+    two = f"{PY} AS r\nUSER root\n{PY} AS a\nUSER 1000\n"
+    assert _root_problems(inline(two, target="r"), bundle)
+    assert _root_problems(inline(two, target="a"), bundle) == []
+    assert _root_problems(inline(two), bundle) == []
+
+
+def test_compose_user_decides_regardless_of_target_or_inline(bundle):
+    dockerfile = f"{PY} AS rootstage\nUSER root\n{PY} AS appstage\nUSER 1000\n"
+    cfg = _build_cfg(bundle, dockerfile, target="rootstage")
+    cfg["services"]["app"]["user"] = "1000"
+    assert _root_problems(cfg, bundle) == []
+    cfg = _build_cfg(bundle, dockerfile, target="appstage")
+    cfg["services"]["app"]["user"] = "0"
+    assert _root_problems(cfg, bundle)
+
+
+def test_the_generated_dockerfile_still_validates(bundle):
+    assert safety_problems(_cfg(bundle), bundle) == []
+
+
+@pytest.mark.parametrize(
+    "build,dockerfile",
+    [
+        ({"target": "rootstage"}, f"{PY} AS rootstage\nUSER root\n{PY} AS appstage\nUSER 1000\n"),
+        ({"dockerfile_inline": f"{PY}\nUSER root\n"}, None),
+    ],
+    ids=["earlier-root-target", "inline-root"],
+)
+def test_run_refuses_both_variants_with_exit_4_before_build(bundle, build, dockerfile):
+    if dockerfile:
+        (bundle / "Dockerfile").write_text(dockerfile)
+    runner, _ = docker_runner(
+        bundle,
+        config_overrides={"build": {"context": str(bundle), "dockerfile": "Dockerfile", **build}},
+    )
+    result = invoke(bundle, "--yes", runner=runner)
+    assert result.exit_code == 4, result.output
+    assert "root" in result.stderr and "unsafe" in result.stderr
+    assert "build" not in verbs(runner) and "up" not in verbs(runner)
