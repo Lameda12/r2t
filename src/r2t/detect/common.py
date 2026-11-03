@@ -114,14 +114,21 @@ def existing_compose_services(snap: Snapshot) -> list[ServiceHint]:
         if not snap.has_file(name):
             continue
         in_services = False
+        child_indent: int | None = None
         for lineno, line in enumerate(snap.read_text(name).splitlines(), start=1):
             if re.match(r"^services:\s*(#.*)?$", line):
-                in_services = True
+                in_services, child_indent = True, None
                 continue
-            if in_services and re.match(r"^\S", line) and not line.startswith("#"):
+            if not in_services or not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if not line[0].isspace():  # next top-level key ends the services block
                 in_services = False
-            m = re.match(r"^ {1,4}([A-Za-z0-9_.-]+):\s*(#.*)?$", line) if in_services else None
-            if m:
+                continue
+            indent = len(line) - len(line.lstrip())
+            if child_indent is None:
+                child_indent = indent
+            m = re.match(r"^([A-Za-z0-9_.-]+):\s*(#.*)?$", line.strip())
+            if indent == child_indent and m:
                 hints.append(
                     ServiceHint(
                         f"service {m.group(1)!r}",

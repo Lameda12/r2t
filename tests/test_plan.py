@@ -248,7 +248,9 @@ def test_unsupported_writes_report_but_no_docker_files_and_exits_3(tmp_path):
     assert plan["status"] == "needs_input"
     assert plan["blockers"][0]["flag"] == "--package-manager {npm,pnpm}"
     assert plan["files"] == {"dockerfile_sha256": None, "compose_sha256": None}
-    assert "--package-manager {npm,pnpm}" in (out / "REPORT.md").read_text()
+    report = (out / "REPORT.md").read_text()
+    assert "--package-manager {npm,pnpm}" in report
+    assert "Dockerfile and compose.yaml content" not in report
     assert "No Dockerfile or compose.yaml" in result.output
 
 

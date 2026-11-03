@@ -92,11 +92,10 @@ def _resolve_app_root(repo_root: Path, opts: Options, insp: Inspection) -> tuple
     candidates = find_candidate_dirs(repo_root, looks_like_app)
     if candidates:
         insp.candidates = candidates
-        listing = "; ".join(f"{c['subdir']} ({c['kind']}): {c['flag']}" for c in candidates)
         insp.block(
             NEEDS_INPUT,
-            "the repository root is not a recognizable app but subdirectories contain "
-            f"candidates: {listing}",
+            "the repository root is not a recognizable app, but "
+            f"{len(candidates)} subdirectories look like supported apps (listed below)",
             "--subdir PATH",
         )
         return None

@@ -84,7 +84,10 @@ def test_existing_container_files_listed_as_evidence_only(make_tree):
         {
             "package.json": vite_pkg(),
             "Dockerfile": "FROM scratch\n",
-            "docker-compose.yml": "services:\n  web:\n    image: x\n  db:\n    image: postgres\n",
+            "docker-compose.yml": (
+                "services:\n  web:\n    image: x\n    volumes:\n      - a:/b\n"
+                "  db:\n    image: postgres\nvolumes:\n  a:\n"
+            ),
             ".devcontainer/devcontainer.json": "{}",
             "Procfile": "web: x\n",
         }
@@ -96,7 +99,8 @@ def test_existing_container_files_listed_as_evidence_only(make_tree):
         ".devcontainer/devcontainer.json",
         "Procfile",
     }
-    assert {s.what for s in insp.services} >= {"service 'web'", "service 'db'"}
+    compose_services = {s.what for s in insp.services if s.evidence.file == "docker-compose.yml"}
+    assert compose_services == {"service 'web'", "service 'db'"}
     assert insp.status == "supported"
     assert_evidence_exists(insp, root)
 

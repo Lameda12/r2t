@@ -199,7 +199,8 @@ def variation_and_pinned(insp: Inspection) -> tuple[list[str], list[str]]:
     if src.resolved_commit:
         pinned.append(f"Source commit {src.resolved_commit}.")
     pinned.append(f"Source snapshot digest sha256:{src.snapshot_digest}.")
-    pinned.append("Dockerfile and compose.yaml content (sha256 recorded in plan.json).")
+    if insp.status == SUPPORTED:
+        pinned.append("Dockerfile and compose.yaml content (sha256 recorded in plan.json).")
     return varies, pinned
 
 
@@ -362,8 +363,9 @@ def render_report(insp: Inspection, plan: dict, output_name: str) -> str:
     for x in insp.excluded:
         if x["category"] not in SENSITIVE_CATEGORIES:
             other[x["category"]] = other.get(x["category"], 0) + 1
-    out += _bullets([f"{code_span(x['path'])}: {x['category']}" for x in sensitive], "")
-    out += _bullets([f"{n} path(s): {cat}" for cat, n in sorted(other.items())], "")
+    excluded_lines = [f"{code_span(x['path'])}: {x['category']}" for x in sensitive]
+    excluded_lines += [f"{n} path(s): {cat}" for cat, n in sorted(other.items())]
+    out += _bullets(excluded_lines, "Nothing was excluded.")
     out.append("")
     if insp.skipped_symlinks:
         out.append("## Symlinks that were not followed or copied")
@@ -429,7 +431,7 @@ def write_bundle(
             (tmp / ".dockerignore").write_text(render_dockerignore())
         (tmp / ".env.template").write_text(render_env_template(insp))
         (tmp / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
-        (tmp / "REPORT.md").write_text(render_report(insp, plan, out.name))
+        (tmp / "REPORT.md").write_text(render_report(insp, plan, str(target)))
         os.rename(tmp, target)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)

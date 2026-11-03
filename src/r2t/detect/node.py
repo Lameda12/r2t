@@ -24,8 +24,10 @@ from ..text import clean
 from .common import NODE_SERVICE_DEPS
 from .semver import RangeError, parse_range, satisfies_major
 
-# Checked against https://nodejs.org/dist/index.json on 2026-11-03: 22 (maintenance LTS),
-# 24 (active LTS) and 26 (LTS since 2026-10-28). 20 reached end of life in April 2026.
+# Checked on 2026-11-03 against https://nodejs.org/dist/index.json and
+# https://github.com/nodejs/Release/blob/main/schedule.json: 22 (maintenance until 2027-04-30),
+# 24 (maintenance since 2026-10-20) and 26 (active LTS since 2026-10-28). 20 reached end of
+# life on 2026-04-30.
 NODE_MAINTAINED = (22, 24, 26)
 NODE_DEFAULT = 24
 PNPM_DEFAULT = "10.34.9"  # newest 10.x on npm on 2026-11-03; matches lockfileVersion 9.0
