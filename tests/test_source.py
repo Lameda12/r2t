@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from conftest import FakeRunner, git
@@ -238,3 +240,72 @@ def test_local_not_git(make_tree):
     with acquire(str(root), None, SubprocessRunner()) as acq:
         assert acq.identity.git_head is None
         assert acq.identity.git_note
+
+
+# ---- Git clean filters must never run (real Git, no mocks) --------------------------------
+
+
+def _filter_repo(make_tree, tmp_path, *, scope: str = "local"):
+    """A repo with a marker-touching clean filter and a stat-dirty tracked file."""
+    marker = tmp_path / "filter-ran"
+    root = make_tree({"a.txt": "one\n", ".gitattributes": "* filter=demo\n"})
+    git(root, "init", "-q")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "init")
+    clean = f"sh -c 'touch {marker}; cat'"
+    if scope == "local":
+        git(root, "config", "filter.demo.clean", clean)
+    # same content, new mtime: git must re-clean the file to decide whether it is modified
+    os.utime(root / "a.txt", (1, 1))
+    return root, marker
+
+
+def test_local_identity_never_runs_configured_clean_filters(make_tree, tmp_path):
+    root, marker = _filter_repo(make_tree, tmp_path)
+    with acquire(str(root), None, SubprocessRunner()) as acq:
+        identity = acq.identity
+    assert not marker.exists(), "a clean filter from .git/config was executed"
+    assert identity.dirty is None, "dirty state must be reported as unknown, not guessed"
+    assert identity.git_head
+    assert "filter" in (identity.git_note or "")
+    assert str(marker) not in (identity.git_note or "")  # never echo configured commands
+
+
+def test_filters_from_the_users_own_global_config_do_not_make_dirty_unknown(
+    make_tree, tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text('[filter "lfs"]\n\tclean = cat\n\trequired = false\n')
+    monkeypatch.setenv("HOME", str(home))
+    root = make_tree({"a.txt": "one\n"})
+    git(root, "init", "-q")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "init")
+    with acquire(str(root), None, SubprocessRunner()) as acq:
+        assert acq.identity.dirty is False
+
+
+def test_inspect_and_plan_do_not_run_filters_either(make_tree, tmp_path):
+    from typer.testing import CliRunner
+
+    from r2t.cli import Services, app
+
+    root, marker = _filter_repo(make_tree, tmp_path)
+    (root / "package.json").write_text('{"scripts": {"dev": "vite"}}')
+    runner = CliRunner()
+    for args in (["inspect", str(root)], ["plan", str(root), "-o", str(tmp_path / "out")]):
+        result = runner.invoke(app, args, obj=Services())
+        assert result.exit_code in (0, 3), result.output
+    assert not marker.exists()
+
+
+def test_filter_defined_through_an_included_config_file_is_also_caught(make_tree, tmp_path):
+    root, marker = _filter_repo(make_tree, tmp_path, scope="none")
+    extra = tmp_path / "evil.cfg"
+    extra.write_text(f"[filter \"demo\"]\n\tclean = sh -c 'touch {marker}; cat'\n")
+    git(root, "config", "include.path", str(extra))
+    os.utime(root / "a.txt", (2, 2))
+    with acquire(str(root), None, SubprocessRunner()) as acq:
+        assert acq.identity.dirty is None
+    assert not marker.exists()

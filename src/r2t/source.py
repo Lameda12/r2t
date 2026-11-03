@@ -198,6 +198,32 @@ def _clone(url: str, ref: str | None, dest: Path, runner: Runner) -> str:
     return sha
 
 
+def _repo_controlled_filters(runner: Runner, base: list[str], env) -> set[str] | None:
+    """Names of filter drivers defined by the repository's own config (local or worktree scope).
+
+    Drivers from the user's global or system config are trusted: a repository cannot plant
+    them. Returns None when the config could not be read, which callers treat as unsafe.
+    """
+    result = runner(
+        [*base, "config", "--show-scope", "--get-regexp", r"^filter\."],
+        env=env,
+        timeout=GIT_QUICK_TIMEOUT,
+    )
+    if result.returncode == 1 and not result.stdout.strip():
+        return set()  # git config exits 1 when nothing matches
+    if not result.ok:
+        return None
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        scope, _, rest = line.partition("\t")
+        if scope not in {"local", "worktree", "command"}:
+            continue
+        key = rest.split(None, 1)[0] if rest.strip() else ""
+        parts = key.split(".")
+        names.add(".".join(parts[1:-1]) if len(parts) >= 3 else key)
+    return names
+
+
 def local_identity(path: Path, runner: Runner) -> SourceIdentity:
     """Read-only Git metadata. fsmonitor is disabled because a hostile .git/config can run code."""
     identity = SourceIdentity(kind="local", path=str(path))
@@ -219,15 +245,28 @@ def local_identity(path: Path, runner: Runner) -> SourceIdentity:
         identity.git_head = head.stdout.strip()
     else:
         identity.git_note = "Git repository has no commits"
+    filters = _repo_controlled_filters(runner, base, env)
+    if filters is None:
+        identity.git_note = "dirty state unknown: could not check the repository's Git config"
+        return identity
+    if filters:
+        # `git status` re-cleans stat-dirty files through any configured clean filter, which
+        # runs an arbitrary command from the repository's own config. Never do that.
+        names = ", ".join(sorted(filters))
+        identity.git_note = (
+            f"dirty state unknown: the repository's own Git config defines filter driver(s) "
+            f"({names}) and r2t will not run Git commands that could execute them"
+        )
+        return identity
     status = runner(
-        [*base, "status", "--porcelain", "--untracked-files=all"],
+        [*base, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all"],
         env=env,
         timeout=GIT_TIMEOUT,
     )
     if status.ok:
         identity.dirty = bool(status.stdout.strip())
     else:
-        identity.git_note = "could not determine whether the working tree is dirty"
+        identity.git_note = "dirty state unknown: `git status` failed"
     return identity
 
 
