@@ -176,11 +176,24 @@ def _is_root_user(value: object) -> bool:
     return name == "root" or (name.isdigit() and int(name) == 0)
 
 
+_HEREDOC = re.compile(r"<<(-?)\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z_][\w.-]*))")
+
+
+class DockerfileSyntaxError(ValueError):
+    """Dockerfile text whose instruction boundaries cannot be established."""
+
+
 def _instructions(text: str) -> list[tuple[str, str]]:
-    """(INSTRUCTION, arguments) pairs: comments dropped, backslash continuations joined."""
+    """(INSTRUCTION, arguments) pairs: comments dropped, backslash continuations joined.
+
+    Instruction names are split on any whitespace. Heredoc bodies (`RUN <<EOF`, `COPY <<EOF`)
+    belong to the instruction that opened them and are skipped, so text inside them is never
+    mistaken for an instruction. An unterminated heredoc raises DockerfileSyntaxError.
+    """
     out: list[tuple[str, str]] = []
     pending = ""
-    for raw in text.splitlines():
+    lines = iter(text.splitlines())
+    for raw in lines:
         line = raw.strip()
         if not pending and (not line or line.startswith("#")):
             continue
@@ -191,11 +204,20 @@ def _instructions(text: str) -> list[tuple[str, str]]:
             continue
         full = (pending + line).strip()
         pending = ""
-        name, _, rest = full.partition(" ")
-        out.append((name.upper(), rest.strip()))
+        parts = full.split(None, 1)
+        name, rest = parts[0].upper(), (parts[1].strip() if len(parts) > 1 else "")
+        out.append((name, rest))
+        if name in ("RUN", "COPY", "ADD"):
+            for m in _HEREDOC.finditer(rest):
+                strip_tabs, delimiter = m.group(1), m.group(2) or m.group(3) or m.group(4)
+                for body in lines:
+                    if (body.lstrip("\t") if strip_tabs else body) == delimiter:
+                        break
+                else:
+                    raise DockerfileSyntaxError(f"a heredoc ({delimiter}) is never terminated")
     if pending.strip():
-        name, _, rest = pending.strip().partition(" ")
-        out.append((name.upper(), rest.strip()))
+        parts = pending.split(None, 1)
+        out.append((parts[0].upper(), parts[1].strip() if len(parts) > 1 else ""))
     return out
 
 
@@ -209,7 +231,11 @@ def dockerfile_user(text: str, target: str | None = None) -> tuple[str | None, s
     """
     stages: list[dict] = []  # {"name", "user", "unresolved"}
     by_name: dict[str, dict] = {}
-    for name, rest in _instructions(text):
+    try:
+        instructions = _instructions(text)
+    except DockerfileSyntaxError as exc:
+        return None, str(exc)
+    for name, rest in instructions:
         if name == "FROM":
             tokens = [t for t in rest.split() if not t.startswith("--")]
             if not tokens:

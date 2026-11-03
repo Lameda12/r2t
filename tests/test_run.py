@@ -714,6 +714,48 @@ def test_users_that_depend_on_variables_cannot_be_verified_and_are_refused(bundl
     assert _root_problems(cfg, bundle) == []
 
 
+@pytest.mark.parametrize(
+    "dockerfile,root",
+    [
+        # issue #2: heredoc payload lines belong to the RUN/COPY, not to the Dockerfile
+        (f"{PY}\nRUN cat <<EOF > /tmp/x\nUSER 1000\nEOF\n", True),
+        (f"{PY}\nRUN <<EOF\nUSER 1000\nEOF\n", True),
+        (f"{PY}\nRUN <<-EOF\n\tUSER 1000\n\tEOF\n", True),
+        (f"{PY}\nRUN <<'EOF'\nUSER 1000\nEOF\n", True),
+        (f'{PY}\nCOPY <<"EOF" /x\nUSER 1000\nEOF\n', True),
+        (f"{PY}\nCOPY <<A <<B /d/\nUSER 1000\nA\nUSER 1000\nB\n", True),
+        (f"{PY}\nUSER 1000\nRUN <<EOF\nUSER root\nFROM x\nEOF\n", False),
+        (f"{PY}\nRUN <<EOF\nFROM x AS y\nEOF\nUSER 1000\n", False),
+        # a real USER after the heredoc still counts
+        (f"{PY}\nRUN <<EOF\ntrue\nEOF\nUSER 1000\n", False),
+        # tab-separated instruction arguments
+        (f"{PY}\nUSER 1000\nUSER\troot\n", True),
+        (f"{PY}\nUSER\t1000\n", False),
+        ("FROM\tpython:3.12 AS\tx\nUSER\t1000\n", False),
+        (f"{PY}\nUSER 1000\nUSER \t root\n", True),
+    ],
+)
+def test_heredocs_and_tabs_in_dockerfiles(bundle, dockerfile, root):
+    assert bool(_root_problems(_build_cfg(bundle, dockerfile), bundle)) is root
+
+
+def test_unterminated_heredoc_is_refused_not_guessed(bundle):
+    dockerfile = f"{PY}\nUSER 1000\nRUN <<EOF\nUSER 1000\n"
+    problems = _root_problems(_build_cfg(bundle, dockerfile), bundle)
+    assert problems and any("verify" in p for p in problems), problems
+
+
+def test_issue_2_repros_are_refused_by_run_before_build(bundle):
+    for dockerfile in (
+        f"{PY}\nRUN cat <<EOF > /tmp/example.txt\nUSER 1000\nEOF\n",
+        f"{PY}\nUSER 1000\nUSER\troot\n",
+    ):
+        cfg = _build_cfg(bundle, dockerfile)
+        assert _root_problems(cfg, bundle)
+        cfg["services"]["app"]["user"] = "1000"
+        assert _root_problems(cfg, bundle) == []
+
+
 def test_inline_dockerfile_variants(bundle):
     def inline(text, **extra):
         cfg = _cfg(bundle)

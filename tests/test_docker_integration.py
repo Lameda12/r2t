@@ -327,6 +327,11 @@ UID_CASES = [
     ("continuation", f"{PY}\nRUN true \\\n  && true\nUSER \\\n  1000\n", None, True),
     ("variable-user", f"{PY}\nARG UID=1000\nUSER ${{UID}}\n", None, True),  # real uid 1000
     ("variable-root", f"{PY}\nARG UID=0\nUSER ${{UID}}\n", None, False),
+    # issue #2: heredoc payload is not Dockerfile syntax; tabs separate instruction arguments
+    ("heredoc-user", f"{PY}\nRUN cat <<EOF > /tmp/x\nUSER 1000\nEOF\n", None, False),
+    ("heredoc-then-user", f"{PY}\nRUN <<EOF\ntrue\nEOF\nUSER 1000\n", None, True),
+    ("tab-root", f"{PY}\nUSER 1000\nUSER\troot\n", None, False),
+    ("tab-user", f"{PY}\nUSER\t1000\n", None, True),
 ]
 
 
