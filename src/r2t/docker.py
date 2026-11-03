@@ -179,6 +179,41 @@ def _is_root_user(value: object) -> bool:
 _HEREDOC = re.compile(r"<<(-?)\s*(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z_][\w.-]*))")
 
 
+def _heredocs(rest: str) -> list[tuple[str, str]]:
+    """(strip_tabs, delimiter) for each real heredoc operator in a RUN/COPY/ADD line.
+
+    `<<` inside single or double quotes, or escaped with a backslash, is a literal string and
+    opens nothing. Quoting that does not balance cannot be interpreted safely, so it raises
+    DockerfileSyntaxError when the line mentions `<<` at all.
+    """
+    found: list[tuple[str, str]] = []
+    quote = ""
+    i = 0
+    while i < len(rest):
+        ch = rest[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(rest):
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch == "\\":
+            i += 1
+        elif ch in "\"'":
+            quote = ch
+        elif rest.startswith("<<", i):
+            m = _HEREDOC.match(rest, i)
+            if m:
+                found.append((m.group(1), m.group(2) or m.group(3) or m.group(4)))
+                i = m.end()
+                continue
+            i += 2
+            continue
+        i += 1
+    if quote and "<<" in rest:
+        raise DockerfileSyntaxError("quoting around a possible heredoc is unbalanced")
+    return found
+
+
 class DockerfileSyntaxError(ValueError):
     """Dockerfile text whose instruction boundaries cannot be established."""
 
@@ -208,8 +243,7 @@ def _instructions(text: str) -> list[tuple[str, str]]:
         name, rest = parts[0].upper(), (parts[1].strip() if len(parts) > 1 else "")
         out.append((name, rest))
         if name in ("RUN", "COPY", "ADD"):
-            for m in _HEREDOC.finditer(rest):
-                strip_tabs, delimiter = m.group(1), m.group(2) or m.group(3) or m.group(4)
+            for strip_tabs, delimiter in _heredocs(rest):
                 for body in lines:
                     if (body.lstrip("\t") if strip_tabs else body) == delimiter:
                         break

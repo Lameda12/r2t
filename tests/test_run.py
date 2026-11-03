@@ -739,6 +739,29 @@ def test_heredocs_and_tabs_in_dockerfiles(bundle, dockerfile, root):
     assert bool(_root_problems(_build_cfg(bundle, dockerfile), bundle)) is root
 
 
+@pytest.mark.parametrize(
+    "dockerfile,root",
+    [
+        # issue #2 follow-up: quoted `<<EOF` is a literal string, not a heredoc operator
+        (f'{PY}\nUSER 1000\nRUN echo "<<EOF"\nUSER root\nRUN cat <<EOF > /tmp/x\nEOF\n', True),
+        (f"{PY}\nUSER 1000\nRUN echo '<<EOF'\nUSER root\nRUN cat <<EOF\nEOF\n", True),
+        (f"{PY}\nUSER 1000\nRUN echo \\<<EOF\nUSER root\nRUN cat <<EOF\nEOF\n", True),
+        (f'{PY}\nUSER 1000\nRUN echo "a <<EOF b"\nUSER root\n', True),
+        # a real heredoc next to a quoted one still hides its body
+        (f'{PY}\nRUN echo "x" && cat <<EOF\nUSER 1000\nEOF\n', True),
+        (f'{PY}\nRUN echo "<<A" <<B\nUSER root\nB\nUSER 1000\n', False),
+    ],
+)
+def test_quoted_heredoc_lookalikes_are_not_heredocs(bundle, dockerfile, root):
+    assert bool(_root_problems(_build_cfg(bundle, dockerfile), bundle)) is root
+
+
+def test_unbalanced_quote_next_to_heredoc_operator_is_refused(bundle):
+    dockerfile = f'{PY}\nUSER 1000\nRUN echo "oops <<EOF\nUSER root\nEOF\n'
+    problems = _root_problems(_build_cfg(bundle, dockerfile), bundle)
+    assert problems and any("verify" in p for p in problems), problems
+
+
 def test_unterminated_heredoc_is_refused_not_guessed(bundle):
     dockerfile = f"{PY}\nUSER 1000\nRUN <<EOF\nUSER 1000\n"
     problems = _root_problems(_build_cfg(bundle, dockerfile), bundle)

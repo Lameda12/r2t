@@ -332,6 +332,19 @@ UID_CASES = [
     ("heredoc-then-user", f"{PY}\nRUN <<EOF\ntrue\nEOF\nUSER 1000\n", None, True),
     ("tab-root", f"{PY}\nUSER 1000\nUSER\troot\n", None, False),
     ("tab-user", f"{PY}\nUSER\t1000\n", None, True),
+    # issue #2 follow-up: a quoted <<EOF is a literal, so the later USER root is real
+    (
+        "quoted-heredoc-root",
+        f'{PY}\nUSER 1000\nRUN echo "<<EOF"\nUSER root\nRUN cat <<EOF > /tmp/x\nEOF\n',
+        None,
+        False,
+    ),
+    (
+        "quoted-heredoc-user",
+        f'{PY}\nUSER root\nRUN echo "<<EOF"\nUSER 1000\nRUN cat <<EOF > /tmp/x\nEOF\n',
+        None,
+        True,
+    ),
 ]
 
 
