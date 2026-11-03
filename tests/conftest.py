@@ -195,6 +195,8 @@ class DockerFake:
         if verb == "ps":
             self.ps_calls += 1
             state = self.state
+            if state == "missing":
+                return RunResult(argv, 0, "")
             if self.states_after:
                 state = self.states_after[min(self.ps_calls - 1, len(self.states_after) - 1)]
             row = {

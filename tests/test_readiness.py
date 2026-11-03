@@ -107,3 +107,48 @@ def test_http_probe_connection_refused_is_not_a_response():
 
 def test_http_probe_refuses_non_loopback():
     assert http_probe("http://example.com/", 1).status is None
+
+
+# ---- an HTTP response only counts when the expected container is running ------------------
+
+
+def test_missing_container_with_http_200_is_not_ready():
+    """Regression: something else answering on the port used to be reported as 'responded'."""
+    probed = []
+
+    def probe(url, timeout):
+        probed.append(url)
+        return ProbeResult(200)
+
+    out, _ = run(probe, [ContainerState("missing")] * 5)
+    assert out.kind == "missing"
+    assert out.status is None
+    assert probed == [], "must not even ask the port while the container is absent"
+
+
+@pytest.mark.parametrize("state", ["created", "restarting", "paused", "unknown", "removing"])
+def test_non_running_container_is_never_probed_and_times_out(state):
+    probed = []
+    out, _ = run(
+        lambda u, t: probed.append(u) or ProbeResult(200), [ContainerState(state)] * 100, timeout=5
+    )
+    assert out.kind == "timeout" and probed == []
+    assert state in (out.last_error or "")
+
+
+def test_container_that_starts_running_later_is_then_accepted():
+    states = [ContainerState("created"), ContainerState("created")] + [
+        ContainerState("running")
+    ] * 5
+    out, _ = run(lambda u, t: ProbeResult(200), states)
+    assert (out.kind, out.status) == ("responded", 200)
+
+
+def test_container_that_disappears_right_after_a_response_is_not_ready():
+    # running when we ask, gone by the time the response has arrived: do not attribute it
+    states = [ContainerState("running"), ContainerState("missing")]
+    out, _ = run(lambda u, t: ProbeResult(200), states)
+    assert out.kind == "missing"
+    states = [ContainerState("running"), ContainerState("exited", 1)]
+    out, _ = run(lambda u, t: ProbeResult(200), states)
+    assert (out.kind, out.exit_code) == ("exited", 1)

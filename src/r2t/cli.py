@@ -478,6 +478,11 @@ def _report_launch(bundle, result: LaunchResult, *, port: int, timeout: float) -
         err.print(
             f"[red]The container exited[/red] before answering (exit code {result.exit_code})."
         )
+    elif result.outcome == "missing":
+        err.print(
+            "[red]The container was not found[/red] while waiting for it; an HTTP response, "
+            "if any, was not attributed to the app."
+        )
     else:
         extra = f" Last probe error: {esc(result.last_error)}." if result.last_error else ""
         err.print(

@@ -103,17 +103,18 @@ Limitations, stated plainly:
 - r2t lists services and variables an app may need (for example `DATABASE_URL`, Prisma, Redis) but does not start them.
 - Existing Dockerfiles, Compose files and devcontainers are listed as evidence and otherwise ignored.
 - Private packages that need a registry token will fail to install: `.npmrc`, `.pypirc` and `.netrc` are deliberately excluded from the snapshot.
+- Node versions are intersected as full version ranges. A range that fits no maintained release, or only part of a major, is `needs_input` (use `--runtime-version`); an exact pin such as `.nvmrc` `22.11.0` uses the exact image tag. Python version sources are still reduced to minor versions, so a patch-level conflict between `.python-version` and `requires-python` is not detected.
 - r2t never calls output reproducible. `REPORT.md` lists what can vary between builds (base image tags, unpinned package manager versions, unlocked dependencies, network fetches at build time, dev-server mode) and what is pinned.
 - Verified in this repo's integration tests on Linux only. macOS is expected to work with Docker Desktop but has not been tested. Windows hosts are out of scope.
 
 ## Security model
 
 - `inspect` and `plan` never execute target code: no npm, pnpm, pip, node or python is run against the repo, no module is imported, no script or README command is run. They read files, parse ASTs and run hardened Git commands.
-- Git is run with hooks disabled, `fsmonitor` off, the `file` protocol blocked, no submodules, no prompts, and LFS smudging skipped. Local repositories are read with read-only commands.
+- Git is run with hooks disabled, `fsmonitor` off, the `file` protocol blocked, no submodules, no prompts, and LFS smudging skipped. Local repositories are read with read-only commands; if the repository's own Git config defines filter drivers (which `git status` could execute), the dirty flag is reported as unknown instead.
 - Inputs are validated: only `https://github.com/OWNER/REPO` URLs, refs that cannot be mistaken for options, and subdirectories that stay inside the repository.
 - The snapshot never follows symlinks. Links that are absolute, escape the root or dangle are not copied and are listed in the report. `.git`, `node_modules`, virtualenvs, caches, build output, `.env` and `.env.*` (except `.env.example`-style files), private keys, cloud credentials and registry configs are excluded.
 - Environment variable names are read from example files. Values are never printed or written into the report, `plan.json` or `.env.template`.
-- Containers run unprivileged as a non-root user, with all capabilities dropped and `no-new-privileges`, publish only on `127.0.0.1`, and mount nothing. `run` re-validates the resolved Compose config before every run, so an edited bundle that is privileged, mounts the Docker socket or a host path, uses host namespaces, or publishes on a non-loopback address is refused (exit 4).
+- Containers run unprivileged as a non-root user, with all capabilities dropped and `no-new-privileges`, publish only on `127.0.0.1`, and mount nothing. `run` re-validates the resolved Compose config before every run, so an edited bundle that is privileged, mounts the Docker socket or a host path, uses host namespaces, publishes on a non-loopback address, runs as root, mounts an external volume, or builds from a Dockerfile or context outside the bundle (including through symlinks) is refused (exit 4).
 - Your `.env` is outside the Docker build context, so it is passed to the container at run time and never enters the image.
 
 **Docker is an isolation boundary, not a guarantee that arbitrary code is safe.** Building runs dependency installation (including install scripts), and starting the container runs the repository's code. r2t asks for confirmation before doing either. Read `REPORT.md` and only try repositories you are willing to run.

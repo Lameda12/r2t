@@ -249,3 +249,60 @@ def test_real_compose_config_of_edited_bundles_is_refused_before_building(edit, 
     assert (
         docker("image", "ls", "-q", json.loads((bundle / "plan.json").read_text())["image"]) == ""
     )
+
+
+def test_stray_http_200_without_the_container_is_not_reported_as_ready(tmp_path):
+    """Real Docker: remove the real container right after `up -d`, then let something else answer
+    on the port. r2t must not attribute that response to the app."""
+    import http.server
+    import threading
+
+    from r2t.cli import Services
+    from r2t.runner import SubprocessRunner
+
+    class Stray(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):
+            pass
+
+    servers: list[http.server.HTTPServer] = []
+    port = free_port()
+
+    class Sabotage(SubprocessRunner):
+        def __call__(self, args, **kw):
+            result = super().__call__(args, **kw)
+            if list(args[-2:]) == ["up", "-d"] and result.ok:
+                super().__call__(
+                    [*args[:-2], "down"], cwd=kw.get("cwd"), env=kw.get("env"), timeout=120
+                )
+                srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Stray)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                servers.append(srv)
+            return result
+
+    runner = CliRunner()
+    bundle = tmp_path / "bundle"
+    assert (
+        runner.invoke(app, ["plan", str(FIXTURES / "fastapi-app"), "-o", str(bundle)]).exit_code
+        == 0
+    )
+    try:
+        result = runner.invoke(
+            app,
+            ["run", str(bundle), "--yes", "--timeout", "20", "--host-port", str(port)],
+            obj=Services(runner=Sabotage()),
+        )
+        assert servers, "the sabotage hook did not run"
+        assert get(f"http://127.0.0.1:{port}/")[0] == 200, "the stray server must really answer"
+        assert result.exit_code == 6, result.output + result.stderr
+        assert "not found" in result.stderr
+        assert "responded" not in result.stdout
+    finally:
+        for srv in servers:
+            srv.shutdown()
+        _cleanup(runner, bundle)

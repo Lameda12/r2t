@@ -591,3 +591,20 @@ def test_the_three_reported_edits_are_refused_by_run(bundle, kw, needle):
     assert result.exit_code == 4, result.output
     assert needle in result.stderr
     assert "build" not in verbs(runner) and "up" not in verbs(runner)
+
+
+def test_missing_container_with_http_200_exits_6_and_is_not_reported_as_ready(bundle):
+    runner, _ = docker_runner(bundle, state="missing")
+    result = invoke(bundle, "--yes", "--timeout", "5", runner=runner)  # probe says 200
+    assert result.exit_code == 6, result.output
+    assert "responded" not in result.stdout
+    assert "not found" in result.stderr
+    assert "r2t stop" in result.stderr and "down" not in verbs(runner)
+
+
+def test_ps_failure_is_not_mistaken_for_a_missing_container(bundle):
+    from r2t.docker import container_state, load_bundle
+
+    runner, _ = docker_runner(bundle)
+    runner.handler = lambda argv: __import__("r2t.runner").runner.RunResult(argv, 1, "", "boom")
+    assert container_state(load_bundle(bundle), runner, 8000).state == "unknown"

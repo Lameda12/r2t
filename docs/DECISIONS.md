@@ -25,7 +25,9 @@ verified say so.
 ## Runtime versions
 
 - Node majors 22, 24, 26 form the maintained set. Checked against https://nodejs.org/dist/index.json and the official schedule (https://github.com/nodejs/Release/blob/main/schedule.json): 22 is in maintenance until 2027-04-30, 24 has been in maintenance since 2026-10-20, 26 became active LTS on 2026-10-28. Node 20 reached end of life on 2026-04-30.
-- Ranges map to the highest maintained major that satisfies every declared source, as specified. With no declaration the default is 24: 26 only became LTS days ago, so the no-information path prefers the more settled release (a repo that declares a permissive range such as `>=18` still gets 26, per the spec).
+- Version sources (`.nvmrc`, `.node-version`, `engines.node`) are intersected as full version intervals, not majors, so `.nvmrc` 22.1.0 with `engines.node` >=22.5.0 is a conflict (`needs_input`). Among the maintained majors that remain, the highest wins, as specified.
+- The image must satisfy the intersection: the floating `node:MAJOR` tag when the constraints are open-ended up to the next major; the exact tag (for example `node:22.1.0-bookworm-slim`, an assumption is recorded) when they pin one exact version; otherwise `needs_input`, because a floating tag cannot promise to fall inside a bounded range such as `~22.1`. `--runtime-version 22` accepts the latest 22.x knowingly. Exact tags were checked to exist on Docker Hub for real releases; a pin to a nonexistent version fails at build (exit 5).
+- r2t cannot know offline which patch release `node:MAJOR` currently resolves to, so an open-ended lower bound such as `>=22.99.0` is assumed satisfiable. With no declaration the default is 24: 26 only became LTS days ago, so the no-information path prefers the more settled release (a repo that declares a permissive range such as `>=18` still gets 26, per the spec).
 - A declaration nothing satisfies (for example `.nvmrc` = `20`, or `lts/*`) is `needs_input`.
 - Python 3.11 to 3.13 as specified; the default is 3.12. 3.14 exists on Docker Hub but is outside the specified set.
 - Added `--runtime-version` (Node major such as `22`, or Python minor such as `3.12`). The spec requires every `needs_input` to name a resolving flag, and version conflicts had none. It accepts versions outside the maintained set and records an assumption saying so.
@@ -43,6 +45,10 @@ verified say so.
 - If the repository root itself looks like a supported app (Vite/Next/FastAPI signals) it wins, and other candidate subdirectories are only noted. If the root is not recognizable but subdirectories are, the status is `needs_input` even for a single candidate, as specified.
 - Search depth is 3, skipping the snapshot's excluded directories and symlinks.
 - Evidence paths are relative to the app root, which is the bundle's `source/`.
+
+## Git metadata
+
+- `git status` re-cleans stat-dirty files through any configured clean filter, which runs a command taken from the repository's own `.git/config`. `inspect`/`plan` therefore check, with the read-only `git config --show-scope --get-regexp '^filter\.'`, for filter drivers defined at local, worktree or included scope. If any exist, `git status` is not run and the dirty flag is reported as unknown (`null`, with a note naming the drivers but never their commands). Filters from the user's own global/system config are trusted (a repository cannot plant them) and do not affect the dirty flag. `--ignore-submodules=all` keeps child Git processes out of submodules.
 
 ## Snapshot
 
@@ -75,6 +81,8 @@ verified say so.
 - A port already in use on 127.0.0.1 exits 2 with a `--host-port` suggestion (the exit-code table has no better fit).
 - The URL and port check use the port the resolved Compose config actually publishes, so a user edit of the port mapping is honoured.
 - Any HTTP response, including 404 and 5xx, ends readiness with exit 0; 5xx is called out. r2t never claims the app works.
+- Readiness requires the expected container to be running both before the HTTP request and after the response. A missing container is a failure (exit 6, "not found"); `created`, `restarting`, `unknown` and similar states are waited on without probing; a failed `docker compose ps` is `unknown`, not `missing`. An HTTP response is therefore never attributed to a container that is not there.
+- Bundle boundaries are enforced on resolved paths: the build context and the Dockerfile must resolve (symlinks followed) inside the bundle; `Dockerfile`, `compose.yaml`, `plan.json`, `source/` and `.env` may not be symlinks leaving the bundle; external volumes and volumes with a custom driver or options are refused; `user` may not be root, and when compose sets no user the Dockerfile must end with a non-root `USER`. `env_file` entries are checked with `config --no-env-resolution`, which exists only from Compose 2.36 (verified in Docker's published reference for 2.34 vs 2.36); on older Compose Compose inlines the file before r2t sees it, so that one check cannot run.
 - Additional unsafe-config rules beyond the spec: `uts`/`cgroup`/`userns_mode: host`, `container:`/`service:` network modes, `volumes_from`, secrets/configs, `*=unconfined` security options, build contexts outside the bundle, build `additional_contexts`/`ssh`/`secrets`, and named volumes backed by host paths.
 - Child processes get an allow-listed environment (PATH, HOME, `DOCKER_*`, and for Git the proxy/CA variables). The host environment is never forwarded.
 
@@ -82,6 +90,10 @@ verified say so.
 
 - Runtime: typer, rich, packaging (all justified by the spec). Dev tools are pinned exactly: pytest 9.2.0, ruff 0.17.3, build 1.6.1.
 - Packaging uses setuptools; no other build dependencies.
+
+## CI
+
+- Triggers: push to `main`, `claude/**` and `feat/**`, every pull request, and manual `workflow_dispatch`. The repository has no `main` branch yet; `push: [main]` alone meant no check could ever run. A unit test parses the triggers and matches them against the real branch names. Current action majors (`checkout@v7`, `setup-python@v7`) were read from the actions' tags.
 
 ## Fixtures
 

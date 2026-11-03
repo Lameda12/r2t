@@ -26,10 +26,14 @@ class ContainerState:
     def gone(self) -> bool:
         return self.state in {"exited", "dead"}
 
+    @property
+    def running(self) -> bool:
+        return self.state == "running"
+
 
 @dataclass
 class ReadyOutcome:
-    kind: str  # "responded", "exited", "timeout"
+    kind: str  # "responded", "exited", "missing", "timeout"
     status: int | None = None
     exit_code: int | None = None
     last_error: str | None = None
@@ -69,16 +73,35 @@ def wait_for_ready(
     sleep: Callable[[float], None],
     interval: float = 1.0,
 ) -> ReadyOutcome:
+    """Wait until the expected container is running AND an HTTP endpoint answers.
+
+    A response is only attributed to the app while the container is known to be running,
+    both before and after the request; otherwise anything else listening on the port (or a
+    container that just died) could be mistaken for the app.
+    """
     deadline = clock() + timeout
     last_error: str | None = None
     while True:
         state = container_state()
         if state.gone:
             return ReadyOutcome("exited", exit_code=state.exit_code, last_error=last_error)
-        result = probe(url, REQUEST_TIMEOUT)
-        if result.status is not None:
-            return ReadyOutcome("responded", status=result.status)
-        last_error = result.error
+        if state.state == "missing":
+            return ReadyOutcome("missing", last_error=last_error)
+        if state.running:
+            result = probe(url, REQUEST_TIMEOUT)
+            if result.status is not None:
+                after = container_state()
+                if after.running:
+                    return ReadyOutcome("responded", status=result.status)
+                if after.gone:
+                    return ReadyOutcome("exited", exit_code=after.exit_code)
+                if after.state == "missing":
+                    return ReadyOutcome("missing")
+                last_error = f"container state changed to {after.state} during the request"
+            else:
+                last_error = result.error
+        else:
+            last_error = f"container state is {state.state}"
         if clock() >= deadline:
             return ReadyOutcome("timeout", last_error=last_error)
         sleep(interval)

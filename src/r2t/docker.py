@@ -400,7 +400,9 @@ def container_state(bundle: Bundle, runner: Runner, host_port: int) -> Container
         env=compose_env(host_port),
         timeout=QUICK_TIMEOUT,
     )
-    rows = parse_ps(result.stdout) if result.ok else []
+    if not result.ok:
+        return ContainerState("unknown")  # could not ask; not the same as "no container"
+    rows = parse_ps(result.stdout)
     if not rows:
         return ContainerState("missing")
     for row in rows:
@@ -423,7 +425,7 @@ def tail_logs(bundle: Bundle, runner: Runner, host_port: int, lines: int = 50) -
 
 @dataclass
 class LaunchResult:
-    outcome: str  # ready, build_failed, up_failed, exited, timeout, interrupted_*
+    outcome: str  # ready, build_failed, up_failed, exited, missing, timeout, interrupted_*
     url: str
     status: int | None = None
     exit_code: int | None = None
