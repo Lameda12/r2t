@@ -148,6 +148,8 @@ class DockerFake:
         self.compose_version = kw.get("compose_version", "2.30.0")
         self.info_rc = kw.get("info_rc", 0)
         self.config_overrides = kw.get("config_overrides", {})
+        self.config_top = kw.get("config_top", {})  # extra top-level keys, e.g. volumes
+        self.env_files = kw.get("env_files")  # shown only for `config --no-env-resolution`
         self.build_rc = kw.get("build_rc", 0)
         self.up_rc = kw.get("up_rc", 0)
         self.state = kw.get("state", "running")
@@ -178,6 +180,9 @@ class DockerFake:
                 context=str(self.bundle),
                 **self.config_overrides,
             )
+            cfg.update(self.config_top)
+            if self.env_files is not None and "--no-env-resolution" in argv:
+                cfg["services"]["app"]["env_file"] = self.env_files
             return RunResult(argv, 0, __import__("json").dumps(cfg))
         if verb == "build":
             if self.build_exc:

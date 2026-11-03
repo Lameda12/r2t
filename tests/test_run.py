@@ -421,3 +421,173 @@ def test_logs_and_stop_reject_non_bundles(tmp_path):
     assert run_cmd(tmp_path, "stop", str(tmp_path / "x"), runner=runner).exit_code == 4
     assert run_cmd(tmp_path, "logs", str(tmp_path / "nope"), runner=runner).exit_code == 2
     assert runner.calls == []
+
+
+# ---- bundle boundaries: external volumes, root user, paths and symlinks outside the bundle ----
+
+
+def _cfg(bundle, **svc):
+    from conftest import resolved_config
+
+    return resolved_config("p", 8000, context=str(bundle), **svc)
+
+
+def _vol(source="v"):
+    return [{"type": "volume", "source": source, "target": "/d", "volume": {}}]
+
+
+def test_external_named_volume_is_refused(bundle):
+    cfg = _cfg(bundle, volumes=_vol("ext"))
+    cfg["volumes"] = {"ext": {"name": "ext", "external": True}}
+    problems = safety_problems(cfg, bundle)
+    assert any("external volume" in p and "ext" in p for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"name": "x", "driver": "nfs"},
+        {"name": "x", "driver": "local", "driver_opts": {"type": "nfs", "o": "addr=1.2.3.4"}},
+    ],
+)
+def test_driver_backed_named_volumes_are_refused(bundle, spec):
+    cfg = _cfg(bundle, volumes=_vol("v"))
+    cfg["volumes"] = {"v": spec}
+    assert any("volume" in p for p in safety_problems(cfg, bundle))
+
+
+def test_plain_private_named_and_anonymous_volumes_remain_allowed(bundle):
+    cfg = _cfg(bundle, volumes=[*_vol("v"), {"type": "volume", "target": "/anon", "volume": {}}])
+    cfg["volumes"] = {"v": {"name": "p_v"}}
+    assert safety_problems(cfg, bundle) == []
+
+
+@pytest.mark.parametrize("user", ["0", "root", "0:0", "root:root", "00", "0:1000", " 0 "])
+def test_explicit_root_user_is_refused(bundle, user):
+    problems = safety_problems(_cfg(bundle, user=user), bundle)
+    assert any("root" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("user", ["1000", "node", "app:app", "1000:1000"])
+def test_non_root_users_are_allowed(bundle, user):
+    assert safety_problems(_cfg(bundle, user=user), bundle) == []
+
+
+def _with_dockerfile(bundle, dockerfile):
+    cfg = _cfg(bundle)
+    cfg["services"]["app"]["build"]["dockerfile"] = dockerfile
+    return cfg
+
+
+def test_dockerfile_path_traversal_is_refused(bundle):
+    problems = safety_problems(_with_dockerfile(bundle, "../../outside.Dockerfile"), bundle)
+    assert any("Dockerfile" in p and "outside the bundle" in p for p in problems), problems
+
+
+def test_absolute_dockerfile_outside_is_refused(bundle, tmp_path):
+    other = tmp_path / "elsewhere.Dockerfile"
+    other.write_text("FROM scratch\nUSER 1000\n")
+    problems = safety_problems(_with_dockerfile(bundle, str(other)), bundle)
+    assert any("outside the bundle" in p for p in problems)
+
+
+def test_dockerfile_symlink_to_outside_is_refused(bundle, tmp_path):
+    outside = tmp_path / "evil.Dockerfile"
+    outside.write_text("FROM scratch\nUSER 1000\n")
+    (bundle / "Dockerfile").unlink()
+    (bundle / "Dockerfile").symlink_to(outside)
+    problems = safety_problems(_cfg(bundle), bundle)
+    assert any("Dockerfile" in p and "outside the bundle" in p for p in problems), problems
+
+
+def test_context_symlink_to_outside_is_refused(bundle, tmp_path):
+    (tmp_path / "ctx").mkdir()
+    link = bundle / "ctxlink"
+    link.symlink_to(tmp_path / "ctx")
+    cfg = _cfg(bundle)
+    cfg["services"]["app"]["build"]["context"] = str(link)
+    assert any("outside the bundle" in p for p in safety_problems(cfg, bundle))
+
+
+def test_dockerfile_inside_the_bundle_by_relative_path_is_fine(bundle):
+    (bundle / "sub").mkdir()
+    (bundle / "sub" / "Dockerfile.alt").write_text("FROM scratch\nUSER 1000\n")
+    assert safety_problems(_with_dockerfile(bundle, "sub/Dockerfile.alt"), bundle) == []
+
+
+@pytest.mark.parametrize("last", ["USER root", "USER 0", "USER 0:0", ""])
+def test_dockerfile_that_ends_as_root_is_refused(bundle, last):
+    text = (bundle / "Dockerfile").read_text()
+    text = "\n".join(ln for ln in text.splitlines() if not ln.startswith("USER "))
+    (bundle / "Dockerfile").write_text(text + f"\n{last}\n")
+    problems = safety_problems(_cfg(bundle), bundle)
+    assert any("root" in p for p in problems), problems
+
+
+def test_compose_user_overrides_a_root_dockerfile(bundle):
+    text = (bundle / "Dockerfile").read_text().replace("USER app", "USER root")
+    (bundle / "Dockerfile").write_text(text)
+    assert safety_problems(_cfg(bundle, user="1000"), bundle) == []
+
+
+@pytest.mark.parametrize("name", [".env", "source", "Dockerfile", "compose.yaml"])
+def test_bundle_entries_that_are_symlinks_to_outside_are_refused_by_run(bundle, tmp_path, name):
+    target = tmp_path / "outside-target"
+    target.mkdir() if name == "source" else target.write_text("FROM scratch\nUSER 1000\n")
+    path = bundle / name
+    if path.is_symlink() or path.exists():
+        if path.is_dir() and not path.is_symlink():
+            import shutil
+
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    path.symlink_to(target)
+    runner, _ = docker_runner(bundle)
+    result = invoke(bundle, "--yes", runner=runner)
+    assert result.exit_code == 4, result.output
+    assert name in result.stderr and "outside the bundle" in result.stderr
+    assert "build" not in verbs(runner) and "up" not in verbs(runner)
+
+
+def test_env_file_outside_the_bundle_is_refused_when_compose_can_show_it(bundle):
+    runner, _ = docker_runner(bundle, env_files=[{"path": "/home/someone/.aws/credentials"}])
+    result = invoke(bundle, "--yes", runner=runner)
+    assert result.exit_code == 4
+    assert "env_file" in result.stderr and "outside the bundle" in result.stderr
+
+
+def test_env_file_inside_the_bundle_is_fine(bundle):
+    inside = [{"path": str(bundle / ".env"), "required": False}]
+    runner, _ = docker_runner(bundle, env_files=inside)
+    assert invoke(bundle, "--yes", runner=runner).exit_code == 0
+
+
+@pytest.mark.parametrize(
+    "kw,needle",
+    [
+        (
+            {
+                "config_overrides": {"volumes": _vol("ext")},
+                "config_top": {"volumes": {"ext": {"name": "ext", "external": True}}},
+            },
+            "external volume",
+        ),
+        ({"config_overrides": {"user": "0"}}, "root"),
+        (
+            {
+                "config_overrides": {
+                    "build": {"context": "CTX", "dockerfile": "../../out.Dockerfile"}
+                }
+            },
+            "outside the bundle",
+        ),
+    ],
+)
+def test_the_three_reported_edits_are_refused_by_run(bundle, kw, needle):
+    kw = json.loads(json.dumps(kw).replace("CTX", str(bundle)))
+    runner, _ = docker_runner(bundle, **kw)
+    result = invoke(bundle, "--yes", runner=runner)
+    assert result.exit_code == 4, result.output
+    assert needle in result.stderr
+    assert "build" not in verbs(runner) and "up" not in verbs(runner)

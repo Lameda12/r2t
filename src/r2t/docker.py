@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import socket
 from collections.abc import Callable
@@ -161,6 +162,45 @@ def check_docker(runner: Runner) -> str:
 _HOST_NS = ("pid", "ipc", "uts", "cgroup", "userns_mode")
 
 
+def _inside(path: str | Path, root: Path) -> bool:
+    """Is path inside root once symlinks and `..` are resolved?"""
+    try:
+        resolved = Path(os.path.realpath(path))
+        return resolved.is_relative_to(Path(os.path.realpath(root)))
+    except (OSError, ValueError):
+        return False
+
+
+def _is_root_user(value: object) -> bool:
+    name = str(value).strip().split(":", 1)[0].strip()
+    return name == "root" or (name.isdigit() and int(name) == 0)
+
+
+def _dockerfile_final_user(path: Path) -> str | None:
+    """The USER in effect at the end of the last build stage, or None (meaning root)."""
+    user = None
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        m = re.match(r"^\s*(FROM|USER)\s+(\S+)", line, re.I)
+        if not m:
+            continue
+        user = None if m.group(1).upper() == "FROM" else m.group(2)
+    return user
+
+
+def boundary_problems(bundle_dir: Path) -> list[str]:
+    """Bundle entries that are, or point through symlinks to, locations outside the bundle."""
+    problems = []
+    for name in ("Dockerfile", "compose.yaml", "plan.json", "source", ".env"):
+        path = bundle_dir / name
+        if os.path.lexists(path) and not _inside(path, bundle_dir):
+            problems.append(f"{name} resolves (through a symlink) to a location outside the bundle")
+    return problems
+
+
 def safety_problems(config: dict, bundle_dir: Path) -> list[str]:
     """Inspect a *resolved* Compose config and list everything r2t refuses to run."""
     problems: list[str] = []
@@ -199,10 +239,17 @@ def safety_problems(config: dict, bundle_dir: Path) -> list[str]:
             if vtype == "bind":
                 problems.append(f"{tag} bind-mounts a host path ({vol.get('source')})")
             elif vtype == "volume":
-                spec = top_volumes.get(vol.get("source") or "") or {}
-                opts = spec.get("driver_opts") or {}
-                if opts.get("device") or "bind" in str(opts.get("o", "")):
-                    problems.append(f"{tag} uses a volume that maps a host path")
+                source = vol.get("source") or ""
+                spec = top_volumes.get(source) or {}
+                if spec.get("external"):
+                    problems.append(
+                        f"{tag} mounts external volume {source!r}, which this bundle did not create"
+                    )
+                elif spec.get("driver") not in (None, "", "local") or spec.get("driver_opts"):
+                    problems.append(
+                        f"{tag} uses volume {source!r} with a custom driver or driver options "
+                        "(it can map a host path or remote storage)"
+                    )
             elif vtype not in {"tmpfs"}:
                 problems.append(f"{tag} has a volume of type {vtype!r}")
         for port in svc.get("ports") or []:
@@ -214,21 +261,67 @@ def safety_problems(config: dict, bundle_dir: Path) -> list[str]:
                     f"{port.get('host_ip') or 'all interfaces'}, not 127.0.0.1"
                 )
         build = svc.get("build")
+        user = svc.get("user")
+        if user is not None and _is_root_user(user):
+            problems.append(f"{tag} runs as root (user: {str(user).strip()!r})")
         if isinstance(build, dict):
             ctx = build.get("context")
+            ctx_path = None
             if ctx:
-                try:
-                    inside = Path(ctx).resolve().is_relative_to(bundle_dir.resolve())
-                except OSError:
-                    inside = False
-                if not inside:
+                ctx_path = Path(ctx) if os.path.isabs(ctx) else bundle_dir / ctx
+                if not _inside(ctx_path, bundle_dir):
                     problems.append(f"{tag} builds from a context outside the bundle ({ctx})")
             if build.get("additional_contexts") or build.get("ssh") or build.get("secrets"):
                 problems.append(f"{tag} uses build additional_contexts, ssh or secrets")
             if build.get("network") == "host":
                 problems.append(f"{tag} builds with the host network")
+            if ctx_path is not None and not build.get("dockerfile_inline"):
+                df = build.get("dockerfile") or "Dockerfile"
+                df_path = Path(df) if os.path.isabs(df) else ctx_path / df
+                if not _inside(df_path, bundle_dir):
+                    problems.append(f"{tag} uses a Dockerfile outside the bundle ({df})")
+                elif user is None and df_path.is_file():
+                    final = _dockerfile_final_user(df_path)
+                    if final is None or _is_root_user(final):
+                        problems.append(
+                            f"{tag} would run as root: the Dockerfile does not end with a "
+                            "non-root USER and compose.yaml sets no user"
+                        )
         elif build is not None:
             problems.append(f"{tag} has an unrecognized build section")
+    return problems
+
+
+def _env_file_problems(bundle: Bundle, runner: Runner, host_port: int) -> list[str]:
+    """env_file entries outside the bundle.
+
+    Compose inlines env files into `environment` in the normal resolved config, so the paths
+    are only visible with `--no-env-resolution` (Compose 2.36+). Older versions skip this check.
+    """
+    result = runner(
+        compose_argv(bundle, "config", "--no-env-resolution", "--format", "json"),
+        cwd=bundle.path,
+        env=compose_env(host_port),
+        timeout=QUICK_TIMEOUT,
+    )
+    if not result.ok:
+        return []
+    try:
+        config = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    problems = []
+    for name, svc in (config.get("services") or {}).items():
+        entries = svc.get("env_file") or []
+        if isinstance(entries, str | dict):
+            entries = [entries]
+        for entry in entries:
+            path = entry.get("path") if isinstance(entry, dict) else entry
+            if not path:
+                continue
+            full = Path(path) if os.path.isabs(path) else bundle.path / path
+            if not _inside(full, bundle.path):
+                problems.append(f"service {name!r} reads env_file {path!r}, outside the bundle")
     return problems
 
 
@@ -251,7 +344,8 @@ def validate_bundle(bundle: Bundle, runner: Runner, host_port: int) -> tuple[dic
         config = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise DockerError(f"could not parse `docker compose config` output: {exc}") from exc
-    problems = safety_problems(config, bundle.path)
+    problems = boundary_problems(bundle.path) + safety_problems(config, bundle.path)
+    problems += _env_file_problems(bundle, runner, host_port)
     if problems:
         raise DockerError(
             "refusing to run an unsafe bundle:\n  - " + "\n  - ".join(problems),

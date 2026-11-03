@@ -177,3 +177,75 @@ def test_unsatisfiable_dependency_exits_5(tmp_path):
         assert "Build failed" in run.stderr
     finally:
         _cleanup(runner, bundle)
+
+
+def _edit(bundle: Path, old: str, new: str) -> None:
+    path = bundle / "compose.yaml"
+    text = path.read_text()
+    assert old in text
+    path.write_text(text.replace(old, new, 1))
+
+
+def _break_dockerfile_symlink(bundle: Path) -> None:
+    outside = bundle.parent / "outside.Dockerfile"
+    outside.write_text((bundle / "Dockerfile").read_text())
+    (bundle / "Dockerfile").unlink()
+    (bundle / "Dockerfile").symlink_to(outside)
+
+
+@pytest.mark.parametrize(
+    "edit,needle",
+    [
+        (lambda b: _edit(b, "    init: true", '    init: true\n    user: "0"'), "root"),
+        (
+            lambda b: _edit(
+                b, "      dockerfile: Dockerfile", "      dockerfile: ../outside.Dockerfile"
+            ),
+            "Dockerfile outside the bundle",
+        ),
+        (
+            lambda b: (
+                _edit(b, "    init: true", "    init: true\n    volumes:\n      - ext:/data"),
+                (b / "compose.yaml").write_text(
+                    (b / "compose.yaml").read_text() + "volumes:\n  ext:\n    external: true\n"
+                ),
+            ),
+            "external volume",
+        ),
+        (
+            lambda b: (
+                (b.parent / "outside.env").write_text("X=1\n"),
+                _edit(
+                    b,
+                    "      - path: .env\n        required: false",
+                    "      - path: .env\n        required: false\n      - path: ../outside.env",
+                ),
+            ),
+            "env_file",
+        ),
+        (_break_dockerfile_symlink, "Dockerfile resolves"),
+    ],
+    ids=[
+        "user-root",
+        "dockerfile-traversal",
+        "external-volume",
+        "env-file-outside",
+        "symlinked-dockerfile",
+    ],
+)
+def test_real_compose_config_of_edited_bundles_is_refused_before_building(edit, needle, tmp_path):
+    runner = CliRunner()
+    bundle = tmp_path / "bundle"
+    assert (
+        runner.invoke(app, ["plan", str(FIXTURES / "fastapi-app"), "-o", str(bundle)]).exit_code
+        == 0
+    )
+    project = json.loads((bundle / "plan.json").read_text())["compose_project"]
+    edit(bundle)
+    result = runner.invoke(app, ["run", str(bundle), "--yes", "--host-port", str(free_port())])
+    assert result.exit_code == 4, result.output + result.stderr
+    assert needle in result.stderr, result.stderr
+    assert docker("ps", "-a", "--filter", f"label=com.docker.compose.project={project}", "-q") == ""
+    assert (
+        docker("image", "ls", "-q", json.loads((bundle / "plan.json").read_text())["image"]) == ""
+    )
