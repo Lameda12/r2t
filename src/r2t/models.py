@@ -234,3 +234,14 @@ class Inspection:
             "skipped_symlinks": list(self.skipped_symlinks),
             "excluded": list(self.excluded),
         }
+
+
+@dataclass(frozen=True)
+class Options:
+    """User-supplied overrides. Every one of these is recorded as "user override" evidence."""
+
+    subdir: str | None = None
+    ref: str | None = None
+    package_manager: str | None = None  # "npm" or "pnpm"
+    entry: str | None = None  # MODULE:ATTR
+    runtime_version: str | None = None  # Node major ("22") or Python minor ("3.12")

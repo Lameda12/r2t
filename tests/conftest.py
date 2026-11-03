@@ -68,3 +68,30 @@ def git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True
     ).stdout
+
+
+def run_analyze(path: Path, **opts):
+    """Analyze a local directory without touching Git (fake runner)."""
+    from r2t.analyze import analyze
+    from r2t.models import Options
+    from r2t.source import acquire
+
+    with acquire(str(path), None, FakeRunner()) as acq:
+        insp, snap = analyze(acq, Options(**opts))
+        return insp, snap, acq
+
+
+def assert_evidence_exists(insp, app_root: Path) -> None:
+    """Every file evidence must point at a file that exists (and a line, if numeric)."""
+    refs = [e for d in insp.detections for e in d.evidence]
+    refs += [e for b in insp.blockers for e in b.evidence]
+    refs += [s.evidence for s in insp.services]
+    refs += [s.evidence for s in insp.lifecycle]
+    refs += list(insp.container_files)
+    for ev in refs:
+        if ev.kind != "file" or ev.file is None or ev.detail == "ancestor of the app root":
+            continue
+        path = app_root / ev.file
+        assert path.exists(), f"evidence points at missing file: {ev.ref()}"
+        if ev.locator and ev.locator.isdigit():
+            assert int(ev.locator) <= len(path.read_text().splitlines())
