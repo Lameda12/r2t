@@ -7,7 +7,7 @@ import json
 import os
 import re
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -568,14 +568,18 @@ def launch(
     clock: Callable[[], float],
     sleep: Callable[[float], None],
     say: Callable[[str], None],
+    build_args: Sequence[str] = (),
 ) -> LaunchResult:
-    """build -> up -d -> poll readiness. Containers are always left running for inspection."""
+    """build -> up -d -> poll readiness. Containers are always left running for inspection.
+
+    `build_args` are extra `docker compose build` flags (the benchmark passes --no-cache).
+    """
     url = f"http://127.0.0.1:{host_port}{bundle.readiness_path}"
     env = compose_env(host_port)
     say("build")
     try:
         build = runner(
-            compose_argv(bundle, "build"),
+            compose_argv(bundle, "build", *build_args),
             cwd=bundle.path,
             env=env,
             timeout=BUILD_TIMEOUT,

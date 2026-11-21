@@ -11,6 +11,7 @@ import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -466,3 +467,125 @@ def test_run_refuses_an_inline_root_dockerfile_before_building(tmp_path):
         assert docker("image", "ls", "-q", plan["image"]) == ""
     finally:
         _cleanup(runner, bundle)
+
+
+# ---- r2t bench (real Docker, real Git, real clock) ------------------------------------------
+
+
+def _git_repo(tmp_path: Path, fixture: str, **edits: str) -> Path:
+    """A fresh Git repo containing a fixture, with optional file overrides, one commit."""
+    root = tmp_path / f"{fixture}-repo"
+    shutil.copytree(FIXTURES / fixture, root, ignore=shutil.ignore_patterns("node_modules"))
+    for rel, text in edits.items():
+        (root / rel).write_text(text)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    for args in (["init", "-q"], ["add", "."], ["commit", "-qm", "fixture"]):
+        subprocess.run(["git", *args], cwd=root, env=env, check=True, capture_output=True)
+    return root
+
+
+def _r2t_resources() -> tuple[str, str]:
+    containers = docker("ps", "-a", "--filter", "name=r2t-", "-q").strip()
+    images = docker("image", "ls", "--filter", "reference=r2t/*", "-q").strip()
+    return containers, images
+
+
+APP_HEAD = "from fastapi import FastAPI\n\napp = FastAPI()\n"
+
+
+def test_bench_vite_fixture_reports_a_median_and_cleans_up(tmp_path):
+    repo = _git_repo(tmp_path, "vite-app")
+    result = CliRunner().invoke(
+        app, ["bench", str(repo), "--runs", "2", "--yes", "--timeout", "240"]
+    )
+    assert result.exit_code == 0, result.output + result.stderr
+    row = next(ln for ln in result.stdout.splitlines() if ln.startswith("| vite-app-repo"))
+    cells = [c.strip() for c in row.strip("|").split("|")]
+    assert cells[2] == "2/2" and cells[3].endswith("s") and cells[3][0].isdigit()
+    assert "docker compose build --no-cache" in result.stdout
+    assert _r2t_resources() == ("", "")
+
+
+def test_bench_failed_launch_stays_visible_and_has_no_median(tmp_path):
+    crash = APP_HEAD + "raise RuntimeError('r2t-bench-crash-marker')\n"
+    repo = _git_repo(tmp_path, "fastapi-app", **{"app/main.py": crash})
+    result = CliRunner().invoke(
+        app, ["bench", str(repo), "--runs", "1", "--yes", "--timeout", "120"]
+    )
+    assert result.exit_code == 6, result.output + result.stderr
+    row = next(ln for ln in result.stdout.splitlines() if ln.startswith("| fastapi-app-repo"))
+    cells = [c.strip() for c in row.strip("|").split("|")]
+    assert cells[2] == "0/1" and cells[3].startswith("n/a")
+    assert "- Run 1: stage `readiness`:" in result.stdout
+    assert "r2t-bench-crash-marker" in result.stdout
+    assert _r2t_resources() == ("", "")
+
+
+def test_bench_build_failure_is_reported_at_the_build_stage(tmp_path):
+    reqs = "fastapi==0.162.0\nuvicorn==0.54.0\nr2t-no-such-pkg-xyz==1\n"
+    repo = _git_repo(tmp_path, "fastapi-app", **{"requirements.txt": reqs})
+    result = CliRunner().invoke(app, ["bench", str(repo), "--runs", "1", "--yes"])
+    assert result.exit_code == 5, result.output + result.stderr
+    assert "0/1" in result.stdout and "- Run 1: stage `build`:" in result.stdout
+    assert _r2t_resources() == ("", "")
+
+
+HANG = APP_HEAD + "import time\n\ntime.sleep(300)\n"  # container runs but never serves HTTP
+
+
+def test_bench_timeout_cleans_up_the_still_running_container(tmp_path):
+    repo = _git_repo(tmp_path, "fastapi-app", **{"app/main.py": HANG})
+    result = CliRunner().invoke(app, ["bench", str(repo), "--runs", "1", "--yes", "--timeout", "8"])
+    assert result.exit_code == 6, result.output + result.stderr
+    assert "stage `readiness`" in result.stdout and "no HTTP response within 8s" in result.stdout
+    assert _r2t_resources() == ("", ""), "a running container must be removed after a timeout"
+
+
+def test_bench_sigint_cleans_up_and_still_prints_the_report(tmp_path):
+    import signal
+    import sys
+    import time
+
+    repo = _git_repo(tmp_path, "fastapi-app", **{"app/main.py": HANG})
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "r2t",
+            "bench",
+            str(repo),
+            "--runs",
+            "3",
+            "--yes",
+            "--timeout",
+            "240",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 240
+        while time.monotonic() < deadline and proc.poll() is None:
+            if docker("ps", "--filter", "name=r2t-", "-q").strip():
+                break  # the trial's container is up and waiting for HTTP
+            time.sleep(1)
+        assert proc.poll() is None, "bench exited before the container started"
+        time.sleep(2)
+        proc.send_signal(signal.SIGINT)
+        stdout, stderr = proc.communicate(timeout=180)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 130, stdout + stderr
+    assert (
+        "0/1" in stdout and "stage `interrupted`" in stdout and "stopped by an interrupt" in stdout
+    )
+    assert _r2t_resources() == ("", "")
+    assert list(Path(tempfile.gettempdir()).glob("r2t-bench-*")) == []

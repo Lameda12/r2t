@@ -71,6 +71,45 @@ r2t logs ./try-repo --follow
 r2t stop ./try-repo
 ```
 
+## Benchmark: how long until it serves HTTP?
+
+`r2t bench` answers "from a fresh checkout, how long until this app serves HTTP?" for a local Git repository. For each run it checks out the **committed HEAD** into a temporary directory, plans a bundle, builds it with `docker compose build --no-cache`, starts it, and stops the clock when the same HTTP readiness check that `r2t run` uses passes. Runs are sequential (`--runs N`, default 3). Like `run`, it shows what it will execute and asks first (`--yes` skips the prompt; without a TTY it exits 2 instead of hanging).
+
+```bash
+r2t bench ./my-repo --runs 3
+r2t bench ./monorepo --subdir apps/web --yes
+```
+
+Excerpt from a real run (Linux, Docker 29.9.2, `vite-app` fixture committed to its own repo, 2 runs; progress lines on stderr and the repeated review text omitted):
+
+```console
+$ r2t bench ./vite-app --runs 2 --yes
+## r2t bench
+
+| Repo | Commit | Successful runs | Median time to HTTP |
+|---|---|---|---|
+| vite-app | `1e17db3e025b` | 2/2 | 9.9s |
+
+### Failures
+None.
+
+### Runs
+
+| Run | Result | Elapsed | HTTP status |
+|---|---|---|---|
+| 1 | ok | 13.2s | 200 |
+| 2 | ok | 6.7s | 200 |
+```
+
+The median covers successful runs only; if every run fails the median cell says `n/a`. Each failure is listed with the stage (`checkout`, `plan`, `validate`, `build`, `start`, `readiness`, `interrupted`) and the reason, for example ``- Run 1: stage `readiness`: container exited with code 1 before answering; last log line: ...``. The exit code is that of the first failed stage (0 when every run succeeded, 5 build, 6 start or readiness, 130 interrupted).
+
+What the numbers mean (also printed under every result):
+
+- **Fresh**: new temporary checkout, new Compose project and image name, `--no-cache`, so no project layer or dependency install is reused between runs. Base images are not pulled or cleared per run and may be pre-pulled. Registry or proxy caches, the OS page cache and network speed are not controlled, so expect run-to-run variance.
+- **Timer**: starts before the checkout, stops at the first HTTP response (any status) from the running container. It includes planning, the build and start; it excludes the review prompt and cleanup.
+- **Cleanup**: after every run, including after a timeout or Ctrl-C, r2t removes only what that run created: its Compose project, its image and its temporary directory.
+- **Runner details**: r2t, Python, host, Docker Engine and Compose versions are included in the report.
+
 `inspect` and `plan` accept `--subdir PATH`, `--ref REF` (remote only), `--package-manager {npm,pnpm}`, `--entry MODULE:ATTR` (FastAPI), `--runtime-version VERSION`, and `--json`. `run` accepts `--yes`, `--timeout SECONDS` (default 180) and `--host-port N`.
 
 When a target is `needs_input`, the output tells you which flag to add. For example, a monorepo root lists `--subdir apps/web`, two lockfiles ask for `--package-manager`, two FastAPI apps list each `--entry`.

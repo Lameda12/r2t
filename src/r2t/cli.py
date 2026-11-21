@@ -20,6 +20,15 @@ from rich.markup import escape
 
 from . import __version__
 from .analyze import analyze
+from .bench import (
+    BUILD_FLAGS,
+    BenchReport,
+    environment_details,
+    preflight,
+    render_markdown,
+    resolve_repo,
+    run_trial,
+)
 from .docker import (
     LaunchResult,
     check_docker,
@@ -347,6 +356,15 @@ def plan(
 # ---- run ----------------------------------------------------------------------------------
 
 
+def _print_execution_warning() -> None:
+    """The review text shown before anything is built or started (`run` and `bench`)."""
+    out.print(
+        "\n[yellow]The build installs dependencies from the network, and starting the container "
+        "runs the repository's code.[/yellow]\nDocker is an isolation boundary, not a guarantee "
+        "that arbitrary code is safe."
+    )
+
+
 def _cmd(argv: list[str]) -> str:
     return shlex.join(argv)
 
@@ -395,11 +413,7 @@ def run(
     out.print(f"  R2T_HOST_PORT={published} {esc(build_cmd)}")
     out.print(f"  R2T_HOST_PORT={published} {esc(up_cmd)}")
     out.print(f"Then check: {esc(url)}")
-    out.print(
-        "\n[yellow]The build installs dependencies from the network, and starting the container "
-        "runs the repository's code.[/yellow]\nDocker is an isolation boundary, not a guarantee "
-        "that arbitrary code is safe."
-    )
+    _print_execution_warning()
     if not yes and not typer.confirm("Continue?", default=False):
         err.print("aborted; nothing was built or started")
         raise typer.Exit(EXIT_USAGE)
@@ -544,6 +558,100 @@ def stop(
         "The built image was kept. To remove it: "
         f"[bold]docker image rm {esc(shlex.quote(image))}[/bold]"
     )
+
+
+# ---- bench --------------------------------------------------------------------------------
+
+
+@app.command()
+@guarded
+def bench(
+    ctx: typer.Context,
+    repo: str = typer.Argument(..., help="Local Git repository (its committed HEAD is tested)."),
+    runs: int = typer.Option(3, "--runs", "-n", min=1, max=50, help="Number of trials."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    timeout: float = typer.Option(180.0, "--timeout", min=1, help="Readiness timeout per run."),
+    host_port: int | None = typer.Option(None, "--host-port", min=1, max=65535),
+    subdir: str | None = SubdirOpt,
+    package_manager: PackageManager | None = PmOpt,
+    entry: str | None = EntryOpt,
+    runtime_version: str | None = RuntimeOpt,
+) -> None:
+    """Time checkout to first HTTP response, from a fresh checkout, over several runs."""
+    svc = services_of(ctx)
+    if not yes and not svc.is_tty():
+        raise InputError(
+            "confirmation required but stdin is not a terminal",
+            "re-run with --yes to confirm that the builds and starts may execute repository code",
+        )
+    opts = _options(subdir, None, package_manager, entry, runtime_version)
+    path, identity = resolve_repo(repo, svc.runner)
+    sha = identity.git_head or ""
+
+    # Review step (not timed): show the plan for this commit and the commands every trial runs.
+    insp = preflight(svc.runner, path, sha, opts)
+    _print_inspection(insp, f"r2t bench {clean(repo)} @ {sha[:12]}")
+    if insp.status != SUPPORTED:
+        err.print(
+            f"\n[red]Nothing to benchmark:[/red] the target is {insp.status}. "
+            "Resolve it with the flags shown above."
+        )
+        raise typer.Exit(EXIT_NOT_SUPPORTED)
+    build = _cmd(
+        [
+            "docker",
+            "compose",
+            "-p",
+            "<project>",
+            "-f",
+            "<trial>/bundle/compose.yaml",
+            "build",
+            *BUILD_FLAGS,
+        ]
+    )
+    out.print(f"\n[bold]r2t bench will run {runs} sequential trial(s). Each trial:[/bold]")
+    out.print("  1. checks out the committed HEAD into a new temporary directory")
+    out.print("  2. plans a bundle exactly as `r2t plan` does and validates it like `r2t run`")
+    out.print(f"  3. {esc(build)}")
+    out.print(f"  4. docker compose ... up -d, then waits up to {timeout:g}s for an HTTP response")
+    out.print("  5. removes only its own project (`docker compose down`), image and directory")
+    _print_execution_warning()
+    if not yes and not typer.confirm("Continue?", default=False):
+        err.print("aborted; nothing was built or started")
+        raise typer.Exit(EXIT_USAGE)
+
+    compose_version = check_docker(svc.runner)
+    report = BenchReport(
+        repo=path.name,
+        commit=sha,
+        dirty=identity.dirty,
+        requested_runs=runs,
+        timeout=timeout,
+        environment=environment_details(svc.runner, compose_version),
+    )
+    for i in range(1, runs + 1):
+        err.print(f"[bold]Run {i}/{runs}[/bold]")
+        trial = run_trial(
+            i,
+            repo=path,
+            sha=sha,
+            opts=opts,
+            runner=svc.runner,
+            probe=svc.probe,
+            clock=svc.clock,
+            sleep=svc.sleep,
+            port_free=svc.port_free,
+            timeout=timeout,
+            host_port=host_port,
+            say=lambda phase: err.print(f"  {phase}..."),
+        )
+        report.trials.append(trial)
+        verdict = f"ok in {trial.elapsed:.1f}s" if trial.ok else f"FAILED at {trial.stage}"
+        err.print(f"  run {i}: {verdict}")
+        if trial.stage == "interrupted":
+            break
+    sys.stdout.write("\n" + render_markdown(report))
+    raise typer.Exit(report.exit_code)
 
 
 def main() -> None:
